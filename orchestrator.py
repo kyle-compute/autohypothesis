@@ -60,6 +60,22 @@ def has_git_metadata() -> bool:
     return (ROOT / ".git").exists()
 
 
+def get_origin_remote() -> str:
+    if not has_git_metadata():
+        return "origin"
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return "origin"
+    return result.stdout.strip() or "origin"
+
+
 def get_head_commit() -> str:
     try:
         result = subprocess.run(
@@ -722,9 +738,14 @@ def render_main_agent_prompt(manifest: FleetManifest) -> str:
         f"- `{worker.worker_id}` gpu={worker.gpu_id} worktree=`{worker.worktree_path}` branch=`{worker.branch}`"
         for worker in manifest.workers
     )
+    remote = get_origin_remote()
     return (
         "# Main Agent Protocol\n\n"
         "You are the meta-orchestrator for a multi-GPU autoresearch fleet.\n\n"
+        "Repository identity:\n"
+        f"- Root repo: `{ROOT}`\n"
+        f"- Git remote: `{remote}`\n"
+        "- Default mode: use git worktrees for parallel worker edits, not one shared branch.\n\n"
         "Responsibilities:\n"
         "- Read the shared research state before making decisions.\n"
         "- Monitor every worker's live status and recent run events.\n"
@@ -741,16 +762,22 @@ def render_main_agent_prompt(manifest: FleetManifest) -> str:
         "Loop:\n"
         "1. Keep `uv run python orchestrator.py monitor --interval 5` running in the repo root.\n"
         "2. Inspect `status` and recent experiments.\n"
-        "3. For each completed run, decide keep/discard/crash/replicate and record it.\n"
-        "4. Regenerate worker briefs by running `sync` again.\n"
-        "5. Dispatch new work to any free GPU worker.\n"
+        "3. Ensure each worker agent stays inside its assigned git worktree and branch.\n"
+        "4. For each completed run, decide keep/discard/crash/replicate and record it.\n"
+        "5. Regenerate worker briefs by running `sync` again.\n"
+        "6. Dispatch new work to any free GPU worker.\n"
     )
 
 
 def render_worker_prompt(manifest: FleetManifest, worker: FleetWorker) -> str:
+    remote = get_origin_remote()
     return (
         f"# Worker Agent Protocol: {worker.worker_id}\n\n"
         f"You own GPU `{worker.gpu_id}` and git worktree `{worker.worktree_path}` on branch `{worker.branch}`.\n\n"
+        "Repository identity:\n"
+        f"- Root repo remote: `{remote}`\n"
+        f"- Assigned worktree: `{worker.worktree_path}`\n"
+        "- Default mode: edit and commit inside your assigned git worktree. Do not treat the root repo as your coding checkout.\n\n"
         "Responsibilities:\n"
         "- Edit only your worktree's `train.py`.\n"
         "- Before each new experiment, read shared fleet state so you learn from peer runs.\n"
@@ -764,6 +791,7 @@ def render_worker_prompt(manifest: FleetManifest, worker: FleetWorker) -> str:
         f"- `{worker.prompt_path}`\n\n"
         "Rules:\n"
         "- Stay inside your worktree when editing code.\n"
+        f"- Commit experimental code on branch `{worker.branch}` so the worktree history matches the run history.\n"
         f"- Use the shared root research directory `{RESEARCH_DIR}` as the source of truth.\n"
         "- If another worker just found a strong result in the same hypothesis family, pivot rather than duplicating it.\n"
         "- If a peer crash reveals a broken idea, avoid repeating it unless you are deliberately testing a fix.\n"

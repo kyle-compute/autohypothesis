@@ -6,6 +6,8 @@ This is an experiment to have the LLM do its own research.
 
 Note: this program assumes the repo is git-initialized. If `.git` has been intentionally removed during a reorganization, do not follow the branch/worktree/reset steps yet. Re-enable that flow only after `git init` and a baseline commit.
 
+This repo is git-backed again and the intended multi-agent mode is git worktrees. The canonical remote is `git@github.com:kyle-compute/autoresearch-cuda.git`. If you are running a multi-GPU/autoresearch-org setup, do not put every worker on one shared checkout. Use one git worktree per worker via `orchestrator.py init-fleet --create-worktrees`, and keep each worker inside its assigned worktree/branch.
+
 To set up a new experiment, work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
@@ -92,6 +94,13 @@ d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+
+If you are in fleet mode, interpret that strictly:
+
+- the main agent stays in the repo root
+- each worker agent operates only in its own git worktree
+- each worker branch should map to one worker identity, such as `autoresearch/<tag>-gpu0`
+- workers should not edit the root checkout directly
 
 LOOP FOREVER:
 
