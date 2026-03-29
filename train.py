@@ -685,6 +685,9 @@ def run_training(experiment_config, telemetry: TrainingTelemetry | None = None):
     torch.cuda.manual_seed(42)
     torch.set_float32_matmul_precision("high")
 
+    if telemetry is not None:
+        telemetry.write_live("compiling", progress={"step": 0, "progress_pct": 0.0, "phase": "resolve_attention"})
+
     fa3, kernel_repo, capability = resolve_attention_backend()
     device_name = torch.cuda.get_device_name()
     peak_bf16_flops = get_peak_bf16_flops(capability)
@@ -743,6 +746,8 @@ def run_training(experiment_config, telemetry: TrainingTelemetry | None = None):
         weight_decay=experiment_config.weight_decay,
     )
 
+    if telemetry is not None:
+        telemetry.write_live("compiling", progress={"step": 0, "progress_pct": 0.0, "phase": "torch_compile"})
     model = torch.compile(model, dynamic=False)
     train_loader = make_dataloader(
         tokenizer,
@@ -787,7 +792,7 @@ def run_training(experiment_config, telemetry: TrainingTelemetry | None = None):
 
         torch.cuda.synchronize()
         dt = time.time() - t0
-        if step > experiment_config.startup_exclude_steps:
+        if step >= experiment_config.startup_exclude_steps:
             total_training_time += dt
 
         ema_beta = 0.9
@@ -836,7 +841,7 @@ def run_training(experiment_config, telemetry: TrainingTelemetry | None = None):
             gc.collect()
 
         step += 1
-        if step > experiment_config.startup_exclude_steps and total_training_time >= TIME_BUDGET:
+        if step >= experiment_config.startup_exclude_steps and total_training_time >= TIME_BUDGET:
             break
 
     print()

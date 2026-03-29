@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,9 +288,23 @@ class KnowledgeBase:
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=False, default=_json_default) + "\n"
-    )
+    content = json.dumps(payload, indent=2, sort_keys=False, default=_json_default) + "\n"
+    fd, tmp_path = tempfile.mkstemp(dir=file_path.parent, suffix=".tmp")
+    closed = False
+    try:
+        os.write(fd, content.encode())
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.replace(tmp_path, file_path)
+    except BaseException:
+        if not closed:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def append_jsonl(path: str | Path, payload: dict[str, Any]) -> None:

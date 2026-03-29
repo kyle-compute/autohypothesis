@@ -53,7 +53,7 @@ WORKER_PROMPTS_DIR = FLEET_DIR / "worker-prompts"
 FLEET_BRIEF_PATH = AGGREGATE_DIR / "fleet_brief.md"
 RESULTS_TSV_PATH = ROOT / "results.tsv"
 PROGRESS_PNG_PATH = ROOT / "progress.png"
-STALE_HEARTBEAT_SECONDS = 30.0
+STALE_HEARTBEAT_SECONDS = 180.0
 
 
 def has_git_metadata() -> bool:
@@ -479,12 +479,26 @@ def materialize_fleet_workers(
     return merged
 
 
+def _pid_is_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def is_worker_active(worker: WorkerStatus) -> bool:
-    if worker.state not in {"launching", "running"}:
+    if worker.state not in {"launching", "running", "compiling"}:
         return False
     if worker.heartbeat_age_seconds is None:
         return True
-    return worker.heartbeat_age_seconds <= STALE_HEARTBEAT_SECONDS
+    if worker.heartbeat_age_seconds <= STALE_HEARTBEAT_SECONDS:
+        return True
+    return _pid_is_alive(worker.pid)
 
 
 def collect_experiments() -> list[AggregateExperiment]:
