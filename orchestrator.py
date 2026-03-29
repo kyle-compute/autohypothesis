@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +100,7 @@ def parse_iso(value: str | None) -> datetime | None:
 
 
 def now_utc() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def load_json(path: Path) -> dict[str, Any] | None:
