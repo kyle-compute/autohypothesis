@@ -4,37 +4,30 @@ Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
 """
 
-import argparse
-import gc
-import math
 import os
-import platform
-import subprocess
-import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+import gc
+import math
+import time
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from kernels import get_kernel
+cap = torch.cuda.get_device_capability()
+# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
-from scientific_process import (
-    ExperimentConfig,
-    RunEvent,
-    RunIdentity,
-    WorkerStatus,
-    append_jsonl,
-    utc_now_iso,
-    write_json,
-)
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-fa3 = None
-
+# ---------------------------------------------------------------------------
+# GPT Model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class GPTConfig:
@@ -65,170 +58,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-def resolve_attention_backend():
-    if not torch.cuda.is_available():
-        raise RuntimeError("train.py requires a CUDA GPU.")
-    cap = torch.cuda.get_device_capability()
-    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-    return get_kernel(repo).flash_attn_interface, repo, cap
-
-
-def get_peak_bf16_flops(capability):
-    peaks = {
-        (9, 0): 989.5e12,  # H100 SXM
-        (8, 0): 312.0e12,  # A100 SXM4
-    }
-    return peaks.get(tuple(capability))
-
-
-def safe_head_commit():
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        return "nogit"
-    return result.stdout.strip() or "nogit"
-
-
-class TrainingTelemetry:
-    def __init__(
-        self,
-        identity: RunIdentity,
-        telemetry_dir: str | Path | None,
-        metadata_path: str | Path | None,
-        heartbeat_seconds: float,
-        title: str,
-        commit: str,
-        hypothesis_id: str | None = None,
-    ):
-        self.identity = identity
-        self.telemetry_dir = Path(telemetry_dir) if telemetry_dir else None
-        self.metadata_path = str(metadata_path) if metadata_path else None
-        self.heartbeat_seconds = heartbeat_seconds
-        self.title = title
-        self.commit = commit
-        self.hypothesis_id = hypothesis_id
-        self._last_heartbeat = 0.0
-        self.events_path = None
-        self.live_path = None
-        if self.telemetry_dir is not None:
-            self.telemetry_dir.mkdir(parents=True, exist_ok=True)
-            self.events_path = self.telemetry_dir / "events.jsonl"
-            if self.telemetry_dir.parent.name == "runs":
-                live_root = self.telemetry_dir.parent.parent / "live" / "workers"
-                self.live_path = live_root / f"{identity.worker_id}.json"
-            else:
-                self.live_path = self.telemetry_dir / "worker-status.json"
-
-    @property
-    def enabled(self):
-        return self.telemetry_dir is not None and self.events_path is not None
-
-    def _paths_payload(self):
-        payload = {}
-        if self.telemetry_dir is not None:
-            payload["run_dir"] = str(self.telemetry_dir)
-        if self.events_path is not None:
-            payload["events_path"] = str(self.events_path)
-        if self.live_path is not None:
-            payload["live_path"] = str(self.live_path)
-        if self.metadata_path is not None:
-            payload["metadata_path"] = self.metadata_path
-        return payload
-
-    def emit_event(self, event_type, payload):
-        if not self.enabled:
-            return
-        event = RunEvent(
-            event_type=event_type,
-            recorded_at=utc_now_iso(),
-            run_id=self.identity.run_id,
-            worker_id=self.identity.worker_id,
-            node_id=self.identity.node_id,
-            gpu_id=self.identity.gpu_id,
-            payload=payload,
-        )
-        append_jsonl(self.events_path, event.to_dict())
-
-    def write_live(self, state, metrics=None, progress=None, extra=None):
-        if self.live_path is None:
-            return
-        payload = WorkerStatus(
-            worker_id=self.identity.worker_id,
-            node_id=self.identity.node_id,
-            gpu_id=self.identity.gpu_id,
-            run_id=self.identity.run_id,
-            state=state,
-            updated_at=utc_now_iso(),
-            pid=os.getpid(),
-            commit=self.commit or None,
-            hypothesis_id=self.hypothesis_id,
-            title=self.title or None,
-            metrics=metrics or {},
-            progress=progress or {},
-            paths=self._paths_payload(),
-        )
-        if extra:
-            for key, value in extra.items():
-                setattr(payload, key, value)
-        write_json(self.live_path, payload.to_dict())
-
-    def emit_started(self, config, runtime):
-        payload = {
-            "title": self.title,
-            "commit": self.commit,
-            "config": config,
-            "runtime": runtime,
-            "paths": self._paths_payload(),
-        }
-        self.emit_event("run_started", payload)
-        self.write_live("running", progress={"step": 0, "progress_pct": 0.0})
-        self._last_heartbeat = time.time()
-
-    def maybe_emit_heartbeat(self, progress):
-        if not self.enabled:
-            return
-        now = time.time()
-        if now - self._last_heartbeat < self.heartbeat_seconds:
-            return
-        self._last_heartbeat = now
-        self.emit_event("heartbeat", progress)
-        self.write_live("running", metrics=progress.get("metrics", {}), progress=progress)
-
-    def emit_completed(self, metrics, runtime):
-        payload = {
-            "title": self.title,
-            "commit": self.commit,
-            "metrics": metrics,
-            "runtime": runtime,
-            "paths": self._paths_payload(),
-        }
-        self.emit_event("run_completed", payload)
-        self.write_live("completed", metrics=metrics, progress={"final": True})
-
-    def emit_failed(self, exc, progress=None):
-        payload = {
-            "title": self.title,
-            "commit": self.commit,
-            "error_type": type(exc).__name__,
-            "error_message": str(exc),
-            "paths": self._paths_payload(),
-        }
-        if progress:
-            payload["progress"] = progress
-        self.emit_event("run_failed", payload)
-        self.write_live(
-            "failed",
-            metrics={},
-            progress=progress or {},
-            extra={"notes": f"{type(exc).__name__}: {exc}"},
-        )
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -246,14 +75,12 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size):
-        if fa3 is None:
-            raise RuntimeError("Flash attention backend has not been initialized.")
-
-        B, T, _ = x.size()
+        B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
@@ -265,7 +92,8 @@ class CausalSelfAttention(nn.Module):
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
-        return self.c_proj(y)
+        y = self.c_proj(y)
+        return y
 
 
 class MLP(nn.Module):
@@ -277,7 +105,8 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
-        return self.c_proj(x)
+        x = self.c_proj(x)
+        return x
 
 
 class Block(nn.Module):
@@ -304,12 +133,14 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -317,26 +148,34 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Transformer blocks
         n_embd = self.config.n_embd
-        scale = 3**0.5 * n_embd**-0.5
+        s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -scale, scale)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -scale, scale)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -scale, scale)
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -scale, scale)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        # Value embeddings
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -scale, scale)
+            torch.nn.init.uniform_(ve.weight, -s, s)
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+        # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
@@ -350,7 +189,8 @@ class GPT(nn.Module):
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.bfloat16(), sin.bfloat16()
-        return cos[None, :, None, :], sin[None, :, None, :]
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
@@ -366,14 +206,11 @@ class GPT(nn.Module):
         return window_sizes
 
     def estimate_flops(self):
+        """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (
-            self.transformer.wte.weight.numel()
-            + value_embeds_numel
-            + self.resid_lambdas.numel()
-            + self.x0_lambdas.numel()
-        )
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
@@ -392,12 +229,8 @@ class GPT(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
-            "wte": wte,
-            "value_embeds": value_embeds,
-            "lm_head": lm_head,
-            "transformer_matrices": transformer_matrices,
-            "scalars": scalars,
-            "total": total,
+            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
@@ -409,27 +242,22 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (
-            len(matrix_params)
-            + len(embedding_params)
-            + len(lm_head_params)
-            + len(value_embeds_params)
-            + len(resid_params)
-            + len(x0_params)
-        )
+        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind="adamw", params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind="muon", params=group_params, lr=matrix_lr,
+                kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
@@ -437,8 +265,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction="mean"):
-        _, T = idx.size()
+    def forward(self, idx, targets=None, reduction='mean'):
+        B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
@@ -451,18 +279,20 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
-        logits = self.lm_head(x).float()
-        logits = 15 * torch.tanh(logits / 15)
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            return F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction=reduction,
-            )
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=-1, reduction=reduction)
+            return loss
         return logits
 
+# ---------------------------------------------------------------------------
+# Optimizer (MuonAdamW, single GPU only)
+# ---------------------------------------------------------------------------
 
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -471,7 +301,6 @@ polar_express_coeffs = [
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
-
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -484,13 +313,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+    # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # Polar express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
@@ -504,6 +334,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     g = X
+    # NorMuon variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -515,6 +346,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
+    # Cautious weight decay + parameter update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
@@ -526,6 +358,7 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -538,37 +371,28 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group):
-        for p in group["params"]:
+        for p in group['params']:
             if p.grad is None:
                 continue
             grad = p.grad
             state = self.state[p]
             if not state:
-                state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(p)
-                state["exp_avg_sq"] = torch.zeros_like(p)
-            state["step"] += 1
-            self._adamw_step_t.fill_(state["step"])
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t.fill_(group["eps"])
-            self._adamw_wd_t.fill_(group["weight_decay"])
-            adamw_step_fused(
-                p,
-                grad,
-                state["exp_avg"],
-                state["exp_avg_sq"],
-                self._adamw_step_t,
-                self._adamw_lr_t,
-                self._adamw_beta1_t,
-                self._adamw_beta2_t,
-                self._adamw_eps_t,
-                self._adamw_wd_t,
-            )
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            state['step'] += 1
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_beta1_t.fill_(group['betas'][0])
+            self._adamw_beta2_t.fill_(group['betas'][1])
+            self._adamw_eps_t.fill_(group['eps'])
+            self._adamw_wd_t.fill_(group['weight_decay'])
+            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
+                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
 
     def _step_muon(self, group):
-        params = group["params"]
+        params = group['params']
         if not params:
             return
         p = params[0]
@@ -587,424 +411,220 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(
-            stacked_grads,
-            stacked_params,
-            state["momentum_buffer"],
-            state["second_momentum_buffer"],
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],
-            red_dim,
-        )
+        muon_step_fused(stacked_grads, stacked_params,
+                        state["momentum_buffer"], state["second_momentum_buffer"],
+                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                        self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            if group["kind"] == "adamw":
+            if group['kind'] == 'adamw':
                 self._step_adamw(group)
-            elif group["kind"] == "muon":
+            elif group['kind'] == 'muon':
                 self._step_muon(group)
 
+# ---------------------------------------------------------------------------
+# Hyperparameters (edit these directly, no CLI flags needed)
+# ---------------------------------------------------------------------------
 
-def load_experiment_config(config_path=None):
-    if config_path is None:
-        config_path = os.environ.get("AUTORESEARCH_CONFIG")
-    if config_path:
-        return ExperimentConfig.from_json_file(config_path)
-    return ExperimentConfig()
+# Model architecture
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
+# Optimization
+TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
+MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-def validate_experiment_config(config):
-    if config.depth < 1:
-        raise ValueError("depth must be >= 1")
-    if config.head_dim < 1:
-        raise ValueError("head_dim must be >= 1")
-    if config.device_batch_size < 1:
-        raise ValueError("device_batch_size must be >= 1")
-    if config.total_batch_size < 1:
-        raise ValueError("total_batch_size must be >= 1")
-    if config.final_eval_batch_size < 1:
-        raise ValueError("final_eval_batch_size must be >= 1")
-    if config.startup_exclude_steps < 0:
-        raise ValueError("startup_exclude_steps must be >= 0")
-    if not config.window_pattern:
-        raise ValueError("window_pattern must be non-empty")
-    if any(char not in {"S", "L"} for char in config.window_pattern.upper()):
-        raise ValueError("window_pattern must contain only 'S' and 'L'")
-    tokens_per_fwdbwd = config.device_batch_size * MAX_SEQ_LEN
-    if config.total_batch_size % tokens_per_fwdbwd != 0:
-        raise ValueError(
-            f"total_batch_size={config.total_batch_size} must be divisible by "
-            f"device_batch_size * MAX_SEQ_LEN={tokens_per_fwdbwd}"
-        )
+# Model size
+DEPTH = 8               # number of transformer layers
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# ---------------------------------------------------------------------------
+# Setup: tokenizer, model, optimizer, dataloader
+# ---------------------------------------------------------------------------
 
-def build_model_config(experiment_config, vocab_size):
-    base_dim = experiment_config.depth * experiment_config.aspect_ratio
-    model_dim = ((base_dim + experiment_config.head_dim - 1) // experiment_config.head_dim) * experiment_config.head_dim
-    num_heads = model_dim // experiment_config.head_dim
+t_start = time.time()
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.set_float32_matmul_precision("high")
+device = torch.device("cuda")
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+H100_BF16_PEAK_FLOPS = 989.5e12
+
+tokenizer = Tokenizer.from_directory()
+vocab_size = tokenizer.get_vocab_size()
+print(f"Vocab size: {vocab_size:,}")
+
+def build_model_config(depth):
+    base_dim = depth * ASPECT_RATIO
+    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+    num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN,
-        vocab_size=vocab_size,
-        n_layer=experiment_config.depth,
-        n_head=num_heads,
-        n_kv_head=num_heads,
-        n_embd=model_dim,
-        window_pattern=experiment_config.window_pattern,
+        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=WINDOW_PATTERN,
     )
 
+config = build_model_config(DEPTH)
+print(f"Model config: {asdict(config)}")
 
-def get_lr_multiplier(progress, config):
-    if progress < config.warmup_ratio:
-        return progress / config.warmup_ratio if config.warmup_ratio > 0 else 1.0
-    if progress < 1.0 - config.warmdown_ratio:
+with torch.device("meta"):
+    model = GPT(config)
+model.to_empty(device=device)
+model.init_weights()
+
+param_counts = model.num_scaling_params()
+print("Parameter counts:")
+for key, value in param_counts.items():
+    print(f"  {key:24s}: {value:,}")
+num_params = param_counts['total']
+num_flops_per_token = model.estimate_flops()
+print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+
+optimizer = model.setup_optimizer(
+    unembedding_lr=UNEMBEDDING_LR,
+    embedding_lr=EMBEDDING_LR,
+    scalar_lr=SCALAR_LR,
+    adam_betas=ADAM_BETAS,
+    matrix_lr=MATRIX_LR,
+    weight_decay=WEIGHT_DECAY,
+)
+
+model = torch.compile(model, dynamic=False)
+
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+x, y, epoch = next(train_loader)  # prefetch first batch
+
+print(f"Time budget: {TIME_BUDGET}s")
+print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# Schedules (all based on progress = training_time / TIME_BUDGET)
+
+def get_lr_multiplier(progress):
+    if progress < WARMUP_RATIO:
+        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
-    cooldown = (1.0 - progress) / config.warmdown_ratio
-    return cooldown * 1.0 + (1 - cooldown) * config.final_lr_frac
-
+    else:
+        cooldown = (1.0 - progress) / WARMDOWN_RATIO
+        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
 
+def get_weight_decay(progress):
+    return WEIGHT_DECAY * (1 - progress)
 
-def get_weight_decay(progress, base_weight_decay):
-    return base_weight_decay * (1 - progress)
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
+t_start_training = time.time()
+smooth_train_loss = 0
+total_training_time = 0
+step = 0
 
-def run_training(experiment_config, telemetry: TrainingTelemetry | None = None):
-    global fa3
-    validate_experiment_config(experiment_config)
+while True:
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for micro_step in range(grad_accum_steps):
+        with autocast_ctx:
+            loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
+        loss.backward()
+        x, y, epoch = next(train_loader)
 
-    t_start = time.time()
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.set_float32_matmul_precision("high")
+    # Progress and schedules
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    lrm = get_lr_multiplier(progress)
+    muon_momentum = get_muon_momentum(step)
+    muon_weight_decay = get_weight_decay(progress)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
 
-    if telemetry is not None:
-        telemetry.write_live("compiling", progress={"step": 0, "progress_pct": 0.0, "phase": "resolve_attention"})
+    train_loss_f = train_loss.item()
 
-    fa3, kernel_repo, capability = resolve_attention_backend()
-    device_name = torch.cuda.get_device_name()
-    peak_bf16_flops = get_peak_bf16_flops(capability)
-    device = torch.device("cuda")
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    # Fast fail: abort if loss is exploding or NaN
+    if math.isnan(train_loss_f) or train_loss_f > 100:
+        print("FAIL")
+        exit(1)
 
-    print(f"CUDA device: {device_name} (capability {capability[0]}.{capability[1]})")
-    print(f"Flash attention backend: {kernel_repo}")
-    if peak_bf16_flops is not None:
-        print(f"Peak BF16 FLOPs reference: {peak_bf16_flops / 1e12:.1f} TFLOP/s")
-    else:
-        print("Peak BF16 FLOPs reference: unavailable for this GPU, MFU will be reported as 0.0")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = t1 - t0
 
-    tokenizer = Tokenizer.from_directory()
-    vocab_size = tokenizer.get_vocab_size()
-    print(f"Vocab size: {vocab_size:,}")
+    if step > 10:
+        total_training_time += dt
 
-    config = build_model_config(experiment_config, vocab_size)
-    print(f"Model config: {asdict(config)}")
-    print(f"Scientific config note: {experiment_config.notes}")
-    commit = telemetry.commit if telemetry is not None else safe_head_commit()
-    runtime = {
-        "device_name": device_name,
-        "cuda_capability": f"{capability[0]}.{capability[1]}",
-        "flash_attention_repo": kernel_repo,
-        "peak_bf16_flops": peak_bf16_flops,
-        "commit": commit,
-    }
-    if telemetry is not None:
-        telemetry.emit_started(experiment_config.to_dict(), runtime)
+    # Logging
+    ema_beta = 0.9
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+    pct_done = 100 * progress
+    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    remaining = max(0, TIME_BUDGET - total_training_time)
 
-    with torch.device("meta"):
-        model = GPT(config)
-    model.to_empty(device=device)
-    model.init_weights()
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-    param_counts = model.num_scaling_params()
-    print("Parameter counts:")
-    for key, value in param_counts.items():
-        print(f"  {key:24s}: {value:,}")
-    num_params = param_counts["total"]
-    num_flops_per_token = model.estimate_flops()
-    print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+    # GC management (Python's GC causes ~500ms stalls)
+    if step == 0:
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+    elif (step + 1) % 5000 == 0:
+        gc.collect()
 
-    tokens_per_fwdbwd = experiment_config.device_batch_size * MAX_SEQ_LEN
-    grad_accum_steps = experiment_config.total_batch_size // tokens_per_fwdbwd
-    print(f"Time budget: {TIME_BUDGET}s")
-    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    step += 1
 
-    optimizer = model.setup_optimizer(
-        unembedding_lr=experiment_config.unembedding_lr,
-        embedding_lr=experiment_config.embedding_lr,
-        scalar_lr=experiment_config.scalar_lr,
-        adam_betas=experiment_config.adam_betas,
-        matrix_lr=experiment_config.matrix_lr,
-        weight_decay=experiment_config.weight_decay,
-    )
+    # Time's up — but only stop after warmup steps so we don't count compilation
+    if step > 10 and total_training_time >= TIME_BUDGET:
+        break
 
-    if telemetry is not None:
-        telemetry.write_live("compiling", progress={"step": 0, "progress_pct": 0.0, "phase": "torch_compile"})
-    model = torch.compile(model, dynamic=False)
-    train_loader = make_dataloader(
-        tokenizer,
-        experiment_config.device_batch_size,
-        MAX_SEQ_LEN,
-        "train",
-    )
-    x, y, epoch = next(train_loader)
-    torch.cuda.reset_peak_memory_stats()
+print()  # newline after \r training log
 
-    t_start_training = time.time()
-    smooth_train_loss = 0.0
-    total_training_time = 0.0
-    step = 0
+total_tokens = step * TOTAL_BATCH_SIZE
 
-    while True:
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = model(x, y)
-            train_loss = loss.detach()
-            (loss / grad_accum_steps).backward()
-            x, y, epoch = next(train_loader)
+# Final eval
+model.eval()
+with autocast_ctx:
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
-        lrm = get_lr_multiplier(progress, experiment_config)
-        muon_momentum = get_muon_momentum(step)
-        muon_weight_decay = get_weight_decay(progress, experiment_config.weight_decay)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-            if group["kind"] == "muon":
-                group["momentum"] = muon_momentum
-                group["weight_decay"] = muon_weight_decay
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
+# Final summary
+t_end = time.time()
+startup_time = t_start_training - t_start
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-        train_loss_f = train_loss.item()
-        if math.isnan(train_loss_f) or train_loss_f > 100:
-            print("FAIL")
-            raise SystemExit(1)
-
-        torch.cuda.synchronize()
-        dt = time.time() - t0
-        if step >= experiment_config.startup_exclude_steps:
-            total_training_time += dt
-
-        ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * progress
-        tok_per_sec = int(experiment_config.total_batch_size / dt) if dt > 0 else 0
-        if peak_bf16_flops is not None and dt > 0:
-            mfu = 100 * num_flops_per_token * experiment_config.total_batch_size / dt / peak_bf16_flops
-        else:
-            mfu = 0.0
-        remaining = max(0.0, TIME_BUDGET - total_training_time)
-
-        print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-            f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-            f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-            end="",
-            flush=True,
-        )
-        if telemetry is not None:
-            telemetry.maybe_emit_heartbeat(
-                {
-                    "step": step,
-                    "progress_pct": round(pct_done, 2),
-                    "smooth_loss": round(debiased_smooth_loss, 6),
-                    "tok_per_sec": tok_per_sec,
-                    "mfu_percent": round(mfu, 2),
-                    "epoch": epoch,
-                    "elapsed_training_seconds": round(total_training_time, 1),
-                    "remaining_seconds": round(remaining, 1),
-                    "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1),
-                    "metrics": {
-                        "train_loss": round(debiased_smooth_loss, 6),
-                        "tok_per_sec": tok_per_sec,
-                        "mfu_percent": round(mfu, 2),
-                    },
-                }
-            )
-
-        if step == 0:
-            gc.collect()
-            gc.freeze()
-            gc.disable()
-        elif (step + 1) % 5000 == 0:
-            gc.collect()
-
-        step += 1
-        if step >= experiment_config.startup_exclude_steps and total_training_time >= TIME_BUDGET:
-            break
-
-    print()
-
-    total_tokens = step * experiment_config.total_batch_size
-    model.eval()
-    print(f"Starting final eval with batch size {experiment_config.final_eval_batch_size}...")
-    with autocast_ctx:
-        val_bpb = evaluate_bpb(model, tokenizer, experiment_config.final_eval_batch_size)
-
-    t_end = time.time()
-    startup_time = t_start_training - t_start
-    if peak_bf16_flops is not None and total_training_time > 0 and step > experiment_config.startup_exclude_steps:
-        steady_state_mfu = (
-            100
-            * num_flops_per_token
-            * experiment_config.total_batch_size
-            * (step - experiment_config.startup_exclude_steps - 1)
-            / total_training_time
-            / peak_bf16_flops
-        )
-    else:
-        steady_state_mfu = 0.0
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-    metrics = {
-        "val_bpb": float(val_bpb),
-        "training_seconds": round(total_training_time, 1),
-        "total_seconds": round(t_end - t_start, 1),
-        "startup_seconds": round(startup_time, 1),
-        "peak_vram_mb": round(peak_vram_mb, 1),
-        "mfu_percent": round(steady_state_mfu, 2),
-        "total_tokens_M": round(total_tokens / 1e6, 1),
-        "num_steps": step,
-        "num_params_M": round(num_params / 1e6, 1),
-        "depth": experiment_config.depth,
-    }
-
-    print("---")
-    print(f"val_bpb:          {metrics['val_bpb']:.6f}")
-    print(f"training_seconds: {metrics['training_seconds']:.1f}")
-    print(f"total_seconds:    {metrics['total_seconds']:.1f}")
-    print(f"startup_seconds:  {metrics['startup_seconds']:.1f}")
-    print(f"peak_vram_mb:     {metrics['peak_vram_mb']:.1f}")
-    print(f"mfu_percent:      {metrics['mfu_percent']:.2f}")
-    print(f"total_tokens_M:   {metrics['total_tokens_M']:.1f}")
-    print(f"num_steps:        {metrics['num_steps']}")
-    print(f"num_params_M:     {metrics['num_params_M']:.1f}")
-    print(f"depth:            {metrics['depth']}")
-
-    if telemetry is not None:
-        telemetry.emit_completed(metrics, runtime)
-    return metrics, runtime
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run autoresearch training")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to experiment config JSON",
-    )
-    parser.add_argument(
-        "--metadata-out",
-        type=str,
-        default=None,
-        help="Optional JSON path for rich run metadata",
-    )
-    parser.add_argument(
-        "--run-id",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_RUN_ID"),
-        help="Optional experiment/run id for telemetry",
-    )
-    parser.add_argument(
-        "--worker-id",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_WORKER_ID", "worker-0"),
-        help="Logical worker id",
-    )
-    parser.add_argument(
-        "--node-id",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_NODE_ID", platform.node()),
-        help="Logical node id",
-    )
-    parser.add_argument(
-        "--gpu-id",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_GPU_ID", os.environ.get("CUDA_VISIBLE_DEVICES", "0")),
-        help="Physical GPU id or visible-device identifier",
-    )
-    parser.add_argument(
-        "--telemetry-dir",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_TELEMETRY_DIR"),
-        help="Directory for per-run telemetry files",
-    )
-    parser.add_argument(
-        "--hypothesis-id",
-        type=str,
-        default=os.environ.get("AUTORESEARCH_HYPOTHESIS_ID"),
-        help="Optional hypothesis id for worker telemetry",
-    )
-    parser.add_argument(
-        "--heartbeat-seconds",
-        type=float,
-        default=float(os.environ.get("AUTORESEARCH_HEARTBEAT_SECONDS", "5")),
-        help="Heartbeat interval for live status files",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    experiment_config = load_experiment_config(args.config)
-    telemetry_dir = args.telemetry_dir
-    if telemetry_dir is None and args.run_id:
-        telemetry_dir = str(Path("research") / "runs" / args.run_id)
-    metadata_path = args.metadata_out or os.environ.get("AUTORESEARCH_RUN_METADATA")
-    if metadata_path is None and telemetry_dir is not None:
-        metadata_path = str(Path(telemetry_dir) / "metadata.json")
-
-    run_id = args.run_id or (Path(telemetry_dir).name if telemetry_dir else "adhoc")
-    identity = RunIdentity(
-        run_id=run_id,
-        worker_id=args.worker_id,
-        node_id=args.node_id,
-        gpu_id=args.gpu_id,
-    )
-    telemetry = None
-    if telemetry_dir is not None:
-        telemetry = TrainingTelemetry(
-            identity=identity,
-            telemetry_dir=telemetry_dir,
-            metadata_path=metadata_path,
-            heartbeat_seconds=args.heartbeat_seconds,
-            title=experiment_config.notes,
-            commit=safe_head_commit(),
-            hypothesis_id=args.hypothesis_id,
-        )
-
-    try:
-        metrics, runtime = run_training(experiment_config, telemetry=telemetry)
-        if metadata_path:
-            payload = {
-                "recorded_at": utc_now_iso(),
-                "host": platform.node(),
-                "platform": platform.platform(),
-                "time_budget_seconds": TIME_BUDGET,
-                "max_seq_len": MAX_SEQ_LEN,
-                "run": identity.to_dict(),
-                "config": experiment_config.to_dict(),
-                "metrics": metrics,
-                "runtime": runtime,
-            }
-            write_json(metadata_path, payload)
-    except BaseException as exc:
-        if telemetry is not None:
-            telemetry.emit_failed(exc)
-        raise
-
-
-if __name__ == "__main__":
-    main()
+print("---")
+print(f"val_bpb:          {val_bpb:.6f}")
+print(f"training_seconds: {total_training_time:.1f}")
+print(f"total_seconds:    {t_end - t_start:.1f}")
+print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+print(f"num_steps:        {step}")
+print(f"num_params_M:     {num_params / 1e6:.1f}")
+print(f"depth:            {DEPTH}")
