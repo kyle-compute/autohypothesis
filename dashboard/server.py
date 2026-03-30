@@ -423,6 +423,29 @@ function statCard(label, value, subtitle = '') {
   `;
 }
 
+function compareExperiments(a, b) {
+  const aOrdinal = Number.isFinite(a.ordinal) ? a.ordinal : null;
+  const bOrdinal = Number.isFinite(b.ordinal) ? b.ordinal : null;
+  if (aOrdinal != null && bOrdinal != null && aOrdinal !== bOrdinal) {
+    return aOrdinal - bOrdinal;
+  }
+  if (aOrdinal != null && bOrdinal == null) return -1;
+  if (aOrdinal == null && bOrdinal != null) return 1;
+  const aTime = a.timestamp || '';
+  const bTime = b.timestamp || '';
+  if (aTime !== bTime) {
+    return aTime.localeCompare(bTime);
+  }
+  return String(a.id || '').localeCompare(String(b.id || ''));
+}
+
+function runLabel(item) {
+  if (Number.isFinite(item.ordinal) && item.ordinal > 0) {
+    return `#${item.ordinal}`;
+  }
+  return item.id || 'n/a';
+}
+
 async function load() {
   const res = await fetch('/api/experiments');
   const records = res.ok ? await res.json() : [];
@@ -438,7 +461,7 @@ async function load() {
     return;
   }
 
-  records.sort((a, b) => a.id - b.id);
+  records.sort(compareExperiments);
   const latest = records[records.length - 1];
   const kept = records.filter((item) => item.status === 'keep' || item.status === 'replicate');
   const best = kept.reduce((bestSoFar, item) => {
@@ -459,6 +482,7 @@ async function load() {
     <div>${badge(latest.status)}</div>
     <div class="subtitle">${latest.description || 'No description'}</div>
     <div class="kv">
+      <div class="k">Run</div><div class="mono">${runLabel(latest)}</div>
       <div class="k">Commit</div><div class="mono">${latest.commit || 'unknown'}</div>
       <div class="k">Parent</div><div class="mono">${latest.parent_commit || 'root'}</div>
       <div class="k">When</div><div>${latest.timestamp || 'n/a'}</div>
@@ -556,6 +580,29 @@ function fmt(value, digits = 4) {
   return Number.isFinite(value) ? Number(value).toFixed(digits) : 'n/a';
 }
 
+function compareExperiments(a, b) {
+  const aOrdinal = Number.isFinite(a.ordinal) ? a.ordinal : null;
+  const bOrdinal = Number.isFinite(b.ordinal) ? b.ordinal : null;
+  if (aOrdinal != null && bOrdinal != null && aOrdinal !== bOrdinal) {
+    return aOrdinal - bOrdinal;
+  }
+  if (aOrdinal != null && bOrdinal == null) return -1;
+  if (aOrdinal == null && bOrdinal != null) return 1;
+  const aTime = a.timestamp || '';
+  const bTime = b.timestamp || '';
+  if (aTime !== bTime) {
+    return aTime.localeCompare(bTime);
+  }
+  return String(a.id || '').localeCompare(String(b.id || ''));
+}
+
+function runLabel(exp) {
+  if (Number.isFinite(exp.ordinal) && exp.ordinal > 0) {
+    return `#${exp.ordinal}`;
+  }
+  return exp.id || 'n/a';
+}
+
 function metricCard(label, value) {
   return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div></div>`;
 }
@@ -587,7 +634,7 @@ function renderStats() {
     `<div class="panel stat"><div class="stat-label">Kept</div><div class="stat-value">${kept.length}</div></div>`,
     `<div class="panel stat"><div class="stat-label">Best BPB</div><div class="stat-value">${best ? fmt(best.val_bpb, 6) : 'n/a'}</div><div class="muted mono">${best ? escapeHtml(best.commit) : ''}</div></div>`,
     `<div class="panel stat"><div class="stat-label">Crashes</div><div class="stat-value">${crashes}</div></div>`,
-    `<div class="panel stat"><div class="stat-label">Latest</div><div class="stat-value">#${latest.id}</div><div class="muted mono">${escapeHtml(latest.commit)}</div></div>`,
+    `<div class="panel stat"><div class="stat-label">Latest</div><div class="stat-value">${escapeHtml(runLabel(latest))}</div><div class="muted mono">${escapeHtml(latest.commit)}</div></div>`,
   ].join('');
 }
 
@@ -667,7 +714,7 @@ async function showDetail(exp) {
 
   detail.innerHTML = `
     <div class="detail-title">
-      <h2>#${exp.id}</h2>
+      <h2>${escapeHtml(runLabel(exp))}</h2>
       ${statusBadge(exp.status)}
     </div>
     <div class="hero-value">${fmt(exp.val_bpb, 6)}</div>
@@ -675,6 +722,7 @@ async function showDetail(exp) {
 
     <div class="detail-block">
       <div class="kv">${kvRows}</div>
+      <div class="muted mono" style="margin-top:10px;">run_id ${escapeHtml(exp.id || 'n/a')}</div>
     </div>
 
     <div class="detail-block">
@@ -743,7 +791,7 @@ async function showDetail(exp) {
     diff.textContent = 'Loading diff...';
     diff.hidden = false;
     try {
-      const res = await fetch(`/api/experiments/${exp.id}/diff`);
+      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/diff`);
       const payload = res.ok ? await res.json() : { diff: '' };
       diff.textContent = payload.diff || 'No diff available for this experiment.';
     } catch (error) {
@@ -760,7 +808,7 @@ async function showDetail(exp) {
     md.textContent = 'Loading decision markdown...';
     md.hidden = false;
     try {
-      const res = await fetch(`/api/experiments/${exp.id}/decision-md`);
+      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/decision-md`);
       const payload = res.ok ? await res.json() : { content: '', path: '' };
       const pathEl = document.getElementById('decision-path');
       pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
@@ -772,7 +820,7 @@ async function showDetail(exp) {
 
   (async () => {
     try {
-      const res = await fetch(`/api/experiments/${exp.id}/decision-md`);
+      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/decision-md`);
       const payload = res.ok ? await res.json() : {};
       const pathEl = document.getElementById('decision-path');
       pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
@@ -837,7 +885,7 @@ function renderGraph() {
     return `
       <g class="node" data-id="${item.id}" style="cursor:pointer;">
         <circle cx="${item.x}" cy="${item.y}" r="${item.radius}" fill="${fill}" stroke="${stroke}" stroke-width="${selected && selected.id === item.id ? 4 : 2.2}" opacity="${opacity}" />
-        <text x="${item.x}" y="${item.y + 4}" text-anchor="middle" fill="rgba(229,237,247,0.9)" font-size="11" opacity="${opacity}">#${item.id}</text>
+        <text x="${item.x}" y="${item.y + 4}" text-anchor="middle" fill="rgba(229,237,247,0.9)" font-size="11" opacity="${opacity}">${escapeHtml(runLabel(item))}</text>
         <text x="${item.x}" y="${labelY}" text-anchor="middle" fill="rgba(229,237,247,0.85)" font-size="11" opacity="${opacity}">${fmt(item.val_bpb, 4)}</text>
       </g>
     `;
@@ -854,7 +902,7 @@ function renderGraph() {
 
   Array.from(svg.querySelectorAll('.node')).forEach((node) => {
     node.addEventListener('click', () => {
-      const id = Number(node.getAttribute('data-id'));
+      const id = node.getAttribute('data-id');
       const exp = experiments.find((item) => item.id === id);
       if (exp) showDetail(exp);
     });
@@ -864,7 +912,7 @@ function renderGraph() {
 async function loadExperiments() {
   const res = await fetch('/api/experiments');
   experiments = res.ok ? await res.json() : [];
-  experiments.sort((a, b) => a.id - b.id);
+  experiments.sort(compareExperiments);
   renderStats();
   renderGraph();
   if (selectedId != null) {
@@ -910,13 +958,19 @@ def _load_records() -> list[dict]:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    records.sort(key=lambda item: item.get("id", 0))
+    records.sort(
+        key=lambda item: (
+            item.get("ordinal", 0),
+            item.get("timestamp", ""),
+            str(item.get("id", "")),
+        )
+    )
     return records
 
 
-def _load_record(exp_id: int) -> dict | None:
+def _load_record(exp_id: str) -> dict | None:
     for record in _load_records():
-        if record.get("id") == exp_id:
+        if str(record.get("id")) == exp_id:
             return record
     return None
 
@@ -1046,17 +1100,17 @@ def list_experiments() -> list[dict]:
 
 
 @app.get("/api/experiments/{exp_id}")
-def get_experiment(exp_id: int):
+def get_experiment(exp_id: str):
     for record in _load_records():
-        if record.get("id") == exp_id:
+        if str(record.get("id")) == exp_id:
             return record
     return JSONResponse(status_code=404, content={"error": "not found"})
 
 
 @app.get("/api/experiments/{exp_id}/diff")
-def get_diff(exp_id: int):
+def get_diff(exp_id: str):
     for record in _load_records():
-        if record.get("id") != exp_id:
+        if str(record.get("id")) != exp_id:
             continue
         commit = record.get("commit", "")
         parent = record.get("parent_commit", "")
@@ -1077,7 +1131,7 @@ def get_diff(exp_id: int):
 
 
 @app.get("/api/experiments/{exp_id}/decision-md")
-def get_decision_markdown(exp_id: int):
+def get_decision_markdown(exp_id: str):
     record = _load_record(exp_id)
     if record is None:
         return JSONResponse(status_code=404, content={"error": "not found"})

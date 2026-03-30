@@ -99,7 +99,10 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
         for line in handle:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     return rows
 
 
@@ -202,7 +205,7 @@ class ResultRow:
 class ExperimentRecord:
     """Full record for one experiment run (JSONL storage)."""
     # Identity
-    id: int
+    id: str
     commit: str
     parent_commit: str
     timestamp: str
@@ -221,6 +224,7 @@ class ExperimentRecord:
     peak_vram_gb: float
     num_params_M: float
     depth: int
+    ordinal: int = 0
     # Decision/source metadata
     execution_status: str = ""
     decision_status: str = ""
@@ -296,13 +300,16 @@ def load_records(path: str | Path) -> list[ExperimentRecord]:
     for line in p.read_text().splitlines():
         line = line.strip()
         if line:
-            records.append(ExperimentRecord.from_dict(json.loads(line)))
+            try:
+                records.append(ExperimentRecord.from_dict(json.loads(line)))
+            except json.JSONDecodeError:
+                continue
     return records
 
 
 def next_id(path: str | Path) -> int:
     records = load_records(path)
-    return max((r.id for r in records), default=0) + 1
+    return max((r.ordinal for r in records), default=0) + 1
 
 
 def current_best(path: str | Path) -> float:

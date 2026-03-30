@@ -123,7 +123,11 @@ def now_utc() -> datetime:
 def load_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    return json.loads(path.read_text())
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def write_text(path: Path, content: str) -> None:
@@ -160,6 +164,16 @@ def _float_list(value: Any) -> list[float]:
     if not isinstance(value, list):
         return []
     return [_safe_float(item) for item in value]
+
+
+def _has_numeric_value(value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _dashboard_status(status: str) -> str:
@@ -639,10 +653,18 @@ def collect_experiments() -> list[AggregateExperiment]:
     experiments: list[AggregateExperiment] = []
     for run_dir in iter_run_dirs():
         experiment_id = run_dir.name
-        config = load_json(run_dir / "config.json") or {}
-        metadata = load_json(run_dir / "metadata.json") or {}
-        result = load_json(run_dir / "result.json") or {}
-        plan = load_json(PLANS_DIR / f"{experiment_id}.json") or {}
+        config_path = run_dir / "config.json"
+        metadata_path = run_dir / "metadata.json"
+        result_path = run_dir / "result.json"
+        plan_path = PLANS_DIR / f"{experiment_id}.json"
+        config_payload = load_json(config_path)
+        metadata_payload = load_json(metadata_path)
+        result_payload = load_json(result_path)
+        plan_payload = load_json(plan_path)
+        config = config_payload or {}
+        metadata = metadata_payload or {}
+        result = result_payload or {}
+        plan = plan_payload or {}
         events = read_jsonl(run_dir / "events.jsonl")
         latest_event = events[-1] if events else None
         decision_markdown_path = PLANS_DIR / f"{experiment_id}.md"
@@ -687,20 +709,25 @@ def collect_experiments() -> list[AggregateExperiment]:
         commit = (
             runtime_payload.get("commit")
             or result.get("commit")
-            or plan.get("based_on_commit", "")
+            or payload_identity.get("commit", "")
         )
         parent_commit = (
             result.get("parent_commit")
             or runtime_payload.get("parent_commit")
+            or payload_identity.get("parent_commit", "")
             or plan.get("based_on_commit")
             or ""
         )
+        first_event = events[0] if events else {}
         created_at = (
             plan.get("created_at")
             or metadata.get("recorded_at")
-            or (events[0]["recorded_at"] if events else utc_now_iso())
+            or first_event.get("recorded_at")
+            or utc_now_iso()
         )
         recorded_at = result.get("recorded_at") or metadata.get("recorded_at")
+        if not recorded_at and latest_event is not None:
+            recorded_at = latest_event.get("recorded_at")
         notes = result.get("analysis", "")
         metrics = result.get("metrics") or metadata.get("metrics") or {}
         gpu_name = (
@@ -724,6 +751,35 @@ def collect_experiments() -> list[AggregateExperiment]:
         outcome = result.get("outcome") or plan_hypothesis.get("outcome") or ""
         diff_stat = runtime_payload.get("diff_stat") or result.get("diff_stat") or ""
         diff_hash = runtime_payload.get("diff_hash") or result.get("diff_hash") or ""
+        if not recorded_at:
+            recorded_at = created_at
+
+        validation_errors: list[str] = []
+        if status in {"keep", "discard", "crash", "replicate"}:
+            required_payloads = [
+                ("plan.json", plan_path, plan_payload),
+                ("config.json", config_path, config_payload),
+                ("metadata.json", metadata_path, metadata_payload),
+                ("result.json", result_path, result_payload),
+            ]
+            for label, path, payload in required_payloads:
+                if not path.exists():
+                    validation_errors.append(f"missing {label}")
+                elif payload is None:
+                    validation_errors.append(f"invalid {label}")
+            if not commit:
+                validation_errors.append("missing commit")
+            if not parent_commit:
+                validation_errors.append("missing parent_commit")
+            if not isinstance(config_payload, dict) or not config_payload:
+                validation_errors.append("missing config.json contents")
+            if not _has_numeric_value(metrics.get("val_bpb")):
+                validation_errors.append("missing metrics.val_bpb")
+
+        if validation_errors:
+            prefix = "artifact validation failed: " + "; ".join(validation_errors)
+            notes = f"{prefix}\n\n{notes}".strip()
+            status = "artifact_invalid"
 
         experiments.append(
             AggregateExperiment(
@@ -761,11 +817,13 @@ def experiments_to_results_rows(experiments: list[AggregateExperiment]) -> list[
         if item.status not in {"keep", "discard", "crash", "replicate"}:
             continue
         metrics = item.metrics or {}
+        if not item.commit or not _has_numeric_value(metrics.get("val_bpb")):
+            continue
         peak_vram_mb = float(metrics.get("peak_vram_mb", 0.0) or 0.0)
         rows.append(
             ResultRow(
                 commit=item.commit or "unknown",
-                val_bpb=float(metrics.get("val_bpb", 0.0) or 0.0),
+                val_bpb=float(metrics["val_bpb"]),
                 memory_gb=peak_vram_mb / 1024.0,
                 status=item.status,
                 description=item.title,
@@ -788,9 +846,11 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
     records: list[ExperimentRecord] = []
     for index, item in enumerate(terminal, start=1):
         metrics = item.metrics or {}
-        normalized_config = ExperimentConfig.from_dict(item.config or {}).to_dict()
+        raw_config = item.config if isinstance(item.config, dict) else {}
+        if not item.commit or not item.parent_commit or not _has_numeric_value(metrics.get("val_bpb")):
+            continue
 
-        val_bpb = _safe_float(metrics.get("val_bpb"))
+        val_bpb = float(metrics["val_bpb"])
         previous_best = best_keep if math.isfinite(best_keep) else None
         delta = 0.0 if previous_best is None else val_bpb - previous_best
 
@@ -802,10 +862,10 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
         if peak_vram_gb <= 0.0:
             peak_vram_gb = _safe_float(metrics.get("peak_vram_mb")) / 1024.0
 
-        depth = _safe_int(metrics.get("depth") or normalized_config.get("depth"))
-        head_dim = _safe_int(metrics.get("head_dim") or normalized_config.get("head_dim"))
-        model_dim = _derive_model_dim(normalized_config, metrics, depth, head_dim)
-        n_heads = _derive_n_heads(normalized_config, metrics, model_dim, head_dim)
+        depth = _safe_int(metrics.get("depth") or raw_config.get("depth"))
+        head_dim = _safe_int(metrics.get("head_dim") or raw_config.get("head_dim"))
+        model_dim = _derive_model_dim(raw_config, metrics, depth, head_dim)
+        n_heads = _derive_n_heads(raw_config, metrics, model_dim, head_dim)
         checkpoint_values = _float_list(
             metrics.get("bpb_at_checkpoints")
             or metrics.get("val_bpb_checkpoints")
@@ -813,12 +873,13 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
         )
 
         record = ExperimentRecord(
-            id=index,
-            commit=item.commit or item.experiment_id,
+            id=item.experiment_id,
+            commit=item.commit,
             parent_commit=item.parent_commit,
             timestamp=item.recorded_at or item.created_at,
             status=status,
             description=item.title.strip() or item.experiment_id,
+            ordinal=index,
             execution_status=item.execution_status,
             decision_status=item.decision_status,
             val_bpb=val_bpb,
@@ -850,27 +911,25 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
             n_heads=n_heads,
             head_dim=head_dim,
             window_pattern=str(
-                metrics.get("window_pattern") or normalized_config.get("window_pattern") or ""
+                metrics.get("window_pattern") or raw_config.get("window_pattern") or ""
             ),
             total_batch_size=_safe_int(
-                metrics.get("total_batch_size") or normalized_config.get("total_batch_size")
+                metrics.get("total_batch_size") or raw_config.get("total_batch_size")
             ),
             device_batch_size=_safe_int(
-                metrics.get("device_batch_size") or normalized_config.get("device_batch_size")
+                metrics.get("device_batch_size") or raw_config.get("device_batch_size")
             ),
-            matrix_lr=_safe_float(
-                metrics.get("matrix_lr") or normalized_config.get("matrix_lr")
-            ),
+            matrix_lr=_safe_float(metrics.get("matrix_lr") or raw_config.get("matrix_lr")),
             embedding_lr=_safe_float(
-                metrics.get("embedding_lr") or normalized_config.get("embedding_lr")
+                metrics.get("embedding_lr") or raw_config.get("embedding_lr")
             ),
             weight_decay=_safe_float(
-                metrics.get("weight_decay") or normalized_config.get("weight_decay")
+                metrics.get("weight_decay") or raw_config.get("weight_decay")
             ),
             warmdown_ratio=_safe_float(
-                metrics.get("warmdown_ratio") or normalized_config.get("warmdown_ratio")
+                metrics.get("warmdown_ratio") or raw_config.get("warmdown_ratio")
             ),
-            adam_betas=[_safe_float(item) for item in normalized_config.get("adam_betas", [])],
+            adam_betas=[_safe_float(beta) for beta in raw_config.get("adam_betas", [])],
             worker_id=item.worker_id,
             gpu_id=item.gpu_id,
             hypothesis_id=item.hypothesis_id,
