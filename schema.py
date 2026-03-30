@@ -221,6 +221,9 @@ class ExperimentRecord:
     peak_vram_gb: float
     num_params_M: float
     depth: int
+    # Decision/source metadata
+    execution_status: str = ""
+    decision_status: str = ""
     # Convergence (optional)
     train_bpb: float | None = None
     bpb_at_checkpoints: list[float] = field(default_factory=list)
@@ -230,6 +233,8 @@ class ExperimentRecord:
     # Diff (optional)
     diff_stat: str = ""
     diff_hash: str = ""
+    decision_markdown_path: str = ""
+    decision_markdown: str = ""
     # Platform and config (optional)
     gpu_name: str = ""
     model_dim: int = 0
@@ -420,6 +425,8 @@ class AggregateExperiment:
     gpu_id: str
     created_at: str
     parent_commit: str = ""
+    execution_status: str = ""
+    decision_status: str = ""
     recorded_at: str | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
@@ -427,6 +434,8 @@ class AggregateExperiment:
     hypothesis_id: str = ""
     rationale: str = ""
     outcome: str = ""
+    decision_markdown_path: str = ""
+    decision_markdown: str = ""
     gpu_name: str = ""
     diff_stat: str = ""
     diff_hash: str = ""
@@ -591,6 +600,10 @@ class KnowledgeBase:
         if not file_path.exists():
             return cls(updated_at=utc_now_iso(), repository=repository)
         payload = json.loads(file_path.read_text())
+        return cls(**_filter_kwargs(cls, payload))
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "KnowledgeBase":
         return cls(**_filter_kwargs(cls, payload))
 
     def save(self, path: str | Path) -> None:

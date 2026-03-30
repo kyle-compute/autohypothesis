@@ -131,6 +131,13 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -164,6 +171,12 @@ def _experiment_sort_key(item: AggregateExperiment) -> tuple[datetime, str]:
         parse_iso(item.recorded_at or item.created_at) or now_utc(),
         item.experiment_id,
     )
+
+
+def _terminal_decision_status(value: str | None) -> str:
+    if value in {"keep", "discard", "crash", "replicate"}:
+        return value
+    return ""
 
 
 def _derive_model_dim(config: dict[str, Any], metrics: dict[str, Any], depth: int, head_dim: int) -> int:
@@ -436,8 +449,21 @@ def merge_hypothesis_queue(
     return queue
 
 
-def build_research_brief(rows: list[ResultRow]) -> ResearchBrief:
-    config = ExperimentConfig()
+def current_config_from_best_known(experiments: list[AggregateExperiment]) -> dict[str, Any]:
+    best = best_kept_experiment(experiments)
+    if best is not None:
+        return ExperimentConfig.from_dict(best.config or {}).to_dict()
+    return ExperimentConfig().to_dict()
+
+
+def planning_result_rows(experiments: list[AggregateExperiment]) -> list[ResultRow]:
+    return experiments_to_results_rows(experiments)
+
+
+def build_research_brief(experiments: list[AggregateExperiment]) -> ResearchBrief:
+    existing = load_existing_brief()
+    rows = planning_result_rows(experiments)
+    config = ExperimentConfig.from_dict(current_config_from_best_known(experiments))
     best = best_result(rows)
     best_payload = asdict(best) if best is not None else {}
     findings = summarize_findings(rows)
@@ -453,7 +479,6 @@ def build_research_brief(rows: list[ResultRow]) -> ResearchBrief:
         "Observer dispatch lives in `research_brief.json` via `hypothesis_queue`.",
         "Treat small single-run wins as provisional until replicated.",
     ]
-    existing = load_existing_brief()
     hypothesis_queue = merge_hypothesis_queue(
         existing.hypothesis_queue if existing is not None else None,
         suggested_hypotheses(rows, config),
@@ -557,16 +582,23 @@ def materialize_fleet_workers(
         if live_worker is not None:
             merged.append(live_worker)
             continue
+        worktree_path = Path(manifest_worker.worktree_path)
+        missing_worktree = not worktree_path.exists()
         merged.append(
             WorkerStatus(
                 worker_id=manifest_worker.worker_id,
                 node_id="",
                 gpu_id=str(manifest_worker.gpu_id),
                 run_id=None,
-                state="idle",
+                state="missing_worktree" if missing_worktree else "idle",
                 updated_at=manifest.created_at,
                 title=manifest_worker.current_title,
                 hypothesis_id=manifest_worker.current_hypothesis_id,
+                notes=(
+                    "Run `uv run python orchestrator.py init-fleet --create-worktrees` to materialize this worker."
+                    if missing_worktree
+                    else None
+                ),
                 paths={
                     "worktree_path": manifest_worker.worktree_path,
                     "prompt_path": manifest_worker.prompt_path,
@@ -599,6 +631,10 @@ def is_worker_active(worker: WorkerStatus) -> bool:
     return _pid_is_alive(worker.pid)
 
 
+def is_worker_dispatchable(worker: WorkerStatus) -> bool:
+    return worker.state not in {"missing_worktree"} and not is_worker_active(worker)
+
+
 def collect_experiments() -> list[AggregateExperiment]:
     experiments: list[AggregateExperiment] = []
     for run_dir in iter_run_dirs():
@@ -609,6 +645,10 @@ def collect_experiments() -> list[AggregateExperiment]:
         plan = load_json(PLANS_DIR / f"{experiment_id}.json") or {}
         events = read_jsonl(run_dir / "events.jsonl")
         latest_event = events[-1] if events else None
+        decision_markdown_path = PLANS_DIR / f"{experiment_id}.md"
+        decision_markdown = (
+            decision_markdown_path.read_text() if decision_markdown_path.exists() else ""
+        )
 
         plan_hypothesis = plan.get("hypothesis", {})
         title = (
@@ -617,17 +657,27 @@ def collect_experiments() -> list[AggregateExperiment]:
             or config.get("notes")
             or experiment_id
         )
-        status = "planned"
+        execution_status = ""
         if result:
-            status = result.get("status", "planned")
+            execution_status = result.get("status", "")
         elif latest_event is not None:
             event_type = latest_event.get("event_type")
             if event_type == "run_failed":
-                status = "failed_unrecorded"
+                execution_status = "failed"
             elif event_type == "run_completed":
-                status = "completed_unrecorded"
+                execution_status = "completed"
             elif event_type in {"run_started", "heartbeat"}:
-                status = "running"
+                execution_status = "running"
+        decision_status = result.get("decision_status", "")
+        status = _terminal_decision_status(decision_status)
+        if not status and execution_status in {"keep", "discard", "crash", "replicate"}:
+            status = execution_status
+        if not status and execution_status in {"completed", "failed"}:
+            status = "review_pending"
+        if not status and execution_status:
+            status = execution_status or "planned"
+        if not status:
+            status = "planned"
 
         run_payload = metadata.get("run", {})
         payload_identity = latest_event or {}
@@ -682,6 +732,8 @@ def collect_experiments() -> list[AggregateExperiment]:
                 title=title,
                 commit=commit,
                 parent_commit=parent_commit,
+                execution_status=execution_status,
+                decision_status=decision_status,
                 worker_id=worker_id or "",
                 gpu_id=gpu_id or "",
                 created_at=created_at,
@@ -692,11 +744,14 @@ def collect_experiments() -> list[AggregateExperiment]:
                 hypothesis_id=hypothesis_id,
                 rationale=rationale,
                 outcome=outcome,
+                decision_markdown_path=display_path(decision_markdown_path),
+                decision_markdown=decision_markdown,
                 gpu_name=gpu_name,
                 diff_stat=diff_stat,
                 diff_hash=diff_hash,
             )
         )
+    experiments.sort(key=_experiment_sort_key)
     return experiments
 
 
@@ -720,13 +775,7 @@ def experiments_to_results_rows(experiments: list[AggregateExperiment]) -> list[
 
 
 def effective_result_rows(experiments: list[AggregateExperiment]) -> list[ResultRow]:
-    rows = read_results_tsv(RESULTS_TSV_PATH)
-    if rows:
-        return rows
-    rows = experiments_to_results_rows(experiments)
-    if rows:
-        write_results_tsv(rows)
-    return rows
+    return planning_result_rows(experiments)
 
 
 def build_experiment_records(experiments: list[AggregateExperiment]) -> list[ExperimentRecord]:
@@ -770,6 +819,8 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
             timestamp=item.recorded_at or item.created_at,
             status=status,
             description=item.title.strip() or item.experiment_id,
+            execution_status=item.execution_status,
+            decision_status=item.decision_status,
             val_bpb=val_bpb,
             delta=delta,
             num_steps=_safe_int(metrics.get("num_steps")),
@@ -792,6 +843,8 @@ def build_experiment_records(experiments: list[AggregateExperiment]) -> list[Exp
             ),
             diff_stat=item.diff_stat,
             diff_hash=item.diff_hash,
+            decision_markdown_path=item.decision_markdown_path,
+            decision_markdown=item.decision_markdown,
             gpu_name=item.gpu_name,
             model_dim=model_dim,
             n_heads=n_heads,
@@ -913,10 +966,11 @@ def describe_worker(worker: WorkerStatus) -> str:
     if tok_per_sec is not None:
         metrics.append(f"tok/s={int(tok_per_sec):,}")
     metric_text = ", ".join(metrics) if metrics else "no metrics yet"
+    note_text = f" note={worker.notes}" if worker.notes else ""
     return (
         f"- `{worker.worker_id}` gpu={worker.gpu_id} state={worker.state} "
         f"run={worker.run_id or '-'} age={age} progress={format_progress(worker.progress)} "
-        f"title={worker.title or '-'} {metric_text}"
+        f"title={worker.title or '-'} {metric_text}{note_text}"
     )
 
 
@@ -970,7 +1024,7 @@ def render_fleet_brief(
         "## Best Known Result",
     ]
     if best is None:
-        best_row = best_result(effective_result_rows(experiments))
+        best_row = best_result(planning_result_rows(experiments))
         if best_row is None:
             lines.append("- No kept runs yet.")
         else:
@@ -1020,7 +1074,7 @@ def render_fleet_brief(
 
 def render_observer_protocol(manifest: FleetManifest) -> str:
     worker_list = "\n".join(
-        f"- `{worker.worker_id}` gpu={worker.gpu_id} worktree=`{worker.worktree_path}` branch=`{worker.branch}`"
+        f"- `{worker.worker_id}` gpu={worker.gpu_id} worktree=`{display_path(Path(worker.worktree_path))}` branch=`{worker.branch}`"
         for worker in manifest.workers
     )
     return (
@@ -1031,20 +1085,23 @@ def render_observer_protocol(manifest: FleetManifest) -> str:
         "- Choose the experiment queue. Workers do not self-dispatch in fleet mode.\n"
         "- Persist dispatch state in `research/research_brief.json` by editing `hypothesis_queue`.\n"
         "- A dispatched hypothesis must set `status` to `dispatched` and `assigned_worker` to a worker id.\n"
+        "- For each dispatched hypothesis, author `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md` as the observer-owned dispatch packet.\n"
         "- You own the fleet-level decision after each run: keep, discard, crash, replicate, and whether the branch should advance.\n"
-        "- Workers may report metrics and suggested interpretation, but the observer makes the final decision of record.\n"
-        "- Treat run artifacts as mandatory, not optional. Completed runs are only visible in `/history` after workers write the plan + run bundle and you run `sync`.\n"
-        "- The minimum lineage fields you should expect in a finished run are `commit`, `parent_commit`, `title`, concise `analysis`, and final `metrics.val_bpb`.\n"
+        "- Workers may report metrics and suggested interpretation, but the observer makes the final decision of record and stamps the terminal status that appears in `/history`.\n"
+        "- Only modify a worker branch after that worker is idle and its execution artifacts are fully written. Do not race an active worker.\n"
+        "- Treat run artifacts as mandatory, not optional. Completed runs are only visible in `/history` after the worker writes the run bundle, the observer stamps `decision_status`, and you run `sync`.\n"
+        "- Every dispatched run should also have a scientific decision markdown companion at `research/plans/<experiment_id>.md`.\n"
+        "- The minimum lineage fields you should expect in a finished run are `commit`, `parent_commit`, `title`, `execution_status`, `decision_status`, concise `analysis`, and final `metrics.val_bpb`.\n"
         "- After changing the queue, run `uv run python orchestrator.py sync` so worker assignments regenerate.\n"
         "- Keep `research/search_model.md` current. That file is your scratchpad and theory ledger.\n"
         "- Use the tool-builder only when the fleet needs a reusable script or analysis helper.\n\n"
         "Read on every cycle:\n"
-        f"- `{FLEET_BRIEF_PATH}`\n"
-        f"- `{LIVE_SUMMARY_PATH}`\n"
-        f"- `{BRIEF_PATH}`\n"
-        f"- `{KNOWLEDGE_PATH}`\n"
-        f"- `{SEARCH_MODEL_PATH}`\n"
-        f"- `{TOOLS_REGISTRY_PATH}`\n\n"
+        f"- `{display_path(FLEET_BRIEF_PATH)}`\n"
+        f"- `{display_path(LIVE_SUMMARY_PATH)}`\n"
+        f"- `{display_path(BRIEF_PATH)}`\n"
+        f"- `{display_path(KNOWLEDGE_PATH)}`\n"
+        f"- `{display_path(SEARCH_MODEL_PATH)}`\n"
+        f"- `{display_path(TOOLS_REGISTRY_PATH)}`\n\n"
         "Workers:\n"
         f"{worker_list}\n"
     )
@@ -1076,13 +1133,17 @@ def render_gpu_worker_protocol() -> str:
         "- Run exactly one experiment at a time on your assigned GPU.\n"
         "- Use `CUDA_VISIBLE_DEVICES=<gpu> uv run train.py > run.log 2>&1` so your run stays isolated.\n"
         "- Your default job is execution and reporting, not fleet-level decision making.\n"
+        "- Always write shared artifacts under the repo-root `research/` tree, never under a worktree-local `research/` directory.\n"
         "- Capture metrics, logs, and run artifacts under `research/runs/` for every completed experiment. This is the visualization contract.\n"
-        "- One finished experiment must leave behind: `research/plans/<experiment_id>.json`, `research/runs/<experiment_id>/config.json`, `metadata.json`, `result.json`, and `events.jsonl`.\n"
+        "- One finished experiment must be associated with `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md`, which are authored by the observer before dispatch, plus `research/runs/<experiment_id>/config.json`, `metadata.json`, `result.json`, and `events.jsonl`.\n"
         "- The plan file must include `experiment_id`, `created_at`, `based_on_commit`, `worker_id`, and a `hypothesis` object with `hypothesis_id`, `title`, and `rationale`.\n"
-        "- The result file must include `status`, `recorded_at`, `commit`, `parent_commit`, `title`, concise `analysis`, optional `outcome`, and a `metrics` object containing at least `val_bpb`, `peak_vram_mb`, `num_steps`, `training_seconds`, and `total_seconds` when available.\n"
+        "- Before editing `train.py`, record `parent_commit` as the current HEAD of your worker branch. Make a dedicated experiment commit before training so `commit` and `parent_commit` are explicit.\n"
+        "- The plan markdown is the observer-owned scientific note for the run. It should capture the hypothesis, reference config, planned intervention, and predicted outcome before training starts.\n"
+        "- The result file must include a provisional execution `status` (`completed` or `failed`), `recorded_at`, `commit`, `parent_commit`, `title`, concise `analysis`, optional `outcome`, and a `metrics` object containing at least `val_bpb`, `peak_vram_mb`, `num_steps`, `training_seconds`, and `total_seconds` when available. The observer stamps the terminal status before the run is treated as final.\n"
         "- `metadata.json` should capture runtime identity such as `worker_id`, `gpu_id`, `gpu_name`, and any stable metrics you already know before the final decision.\n"
         "- `events.jsonl` should at minimum append `run_started` and then `run_completed` or `run_failed`; add `heartbeat` only if it helps monitoring.\n"
-        "- Only write `results.tsv` or make the final keep/discard/crash decision if the assignment explicitly asks you to do so.\n"
+        "- After writing execution artifacts, stop. Do not reset or advance the branch until the observer stamps `decision_status` and the next assignment tells you how to proceed.\n"
+        "- Do not hand-edit `results.tsv` in fleet mode; it is derived from the canonical run artifacts.\n"
         "- Read shared state before every run so you avoid duplicating peer work.\n"
     )
 
@@ -1092,9 +1153,9 @@ def render_observer_start() -> str:
         "# Observer Start Here\n\n"
         "Role: `observer`\n\n"
         "Read exactly in this order:\n"
-        f"1. `{OBSERVER_ASSIGNMENT_PATH}`\n"
-        f"2. `{OBSERVER_PROTOCOL_PATH}`\n"
-        f"3. `{SEARCH_MODEL_PATH}`\n"
+        f"1. `{display_path(OBSERVER_ASSIGNMENT_PATH)}`\n"
+        f"2. `{display_path(OBSERVER_PROTOCOL_PATH)}`\n"
+        f"3. `{display_path(SEARCH_MODEL_PATH)}`\n"
     )
 
 
@@ -1103,9 +1164,9 @@ def render_tool_builder_start() -> str:
         "# Tool-Builder Start Here\n\n"
         "Role: `tool-builder`\n\n"
         "Read exactly in this order:\n"
-        f"1. `{TOOL_BUILDER_ASSIGNMENT_PATH}`\n"
-        f"2. `{TOOL_BUILDER_PROTOCOL_PATH}`\n"
-        f"3. `{TOOLS_REGISTRY_PATH}`\n"
+        f"1. `{display_path(TOOL_BUILDER_ASSIGNMENT_PATH)}`\n"
+        f"2. `{display_path(TOOL_BUILDER_PROTOCOL_PATH)}`\n"
+        f"3. `{display_path(TOOLS_REGISTRY_PATH)}`\n"
     )
 
 
@@ -1116,23 +1177,26 @@ def render_worker_start(worker: FleetWorker) -> str:
         "Role: `gpu-worker`\n"
         f"Agent: `{worker.worker_id}`\n\n"
         "Paths:\n"
-        f"- `ROOT` = `{ROOT}`\n"
-        f"- `WORKTREE` = `{worker.worktree_path}`\n"
-        f"- `RESEARCH` = `{RESEARCH_DIR}`\n"
-        f"- `TOOLS` = `{PUBLISHED_TOOLS_DIR}`\n"
-        f"- `SEARCH_MODEL` = `{SEARCH_MODEL_PATH}`\n\n"
+        f"- `ROOT` = current checkout root\n"
+        f"- `WORKTREE` = `{display_path(Path(worker.worktree_path))}`\n"
+        f"- `RESEARCH` = `{display_path(RESEARCH_DIR)}`\n"
+        f"- `TOOLS` = `{display_path(PUBLISHED_TOOLS_DIR)}`\n"
+        f"- `SEARCH_MODEL` = `{display_path(SEARCH_MODEL_PATH)}`\n\n"
         "Read exactly in this order:\n"
-        f"1. `{assignment_path}`\n"
-        f"2. `{GPU_WORKER_PROTOCOL_PATH}`\n"
-        f"3. `{SEARCH_MODEL_PATH}`\n"
+        f"1. `{display_path(assignment_path)}`\n"
+        f"2. `{display_path(GPU_WORKER_PROTOCOL_PATH)}`\n"
+        f"3. `{display_path(SEARCH_MODEL_PATH)}`\n"
     )
 
 
 def render_legacy_main_prompt() -> str:
     return (
-        "# Main Agent Alias\n\n"
-        "The fleet now uses an observer-centered N+2 topology.\n"
-        f"Use `{OBSERVER_PROMPT_PATH}` as the root orchestration prompt.\n"
+        "# Main Agent Bootstrap\n\n"
+        "Use this prompt for the top-level orchestrator before the fleet exists.\n\n"
+        "1. Read `program.md` and establish the baseline on this hardware.\n"
+        "2. Record the best-known baseline config locally.\n"
+        "3. Initialize the fleet once the baseline is established.\n"
+        f"4. Hand off to `{display_path(OBSERVER_PROMPT_PATH)}` for N+2 fleet dispatch.\n"
     )
 
 
@@ -1142,7 +1206,7 @@ def render_observer_assignment(
     brief: ResearchBrief,
     registry: ToolRegistry,
 ) -> str:
-    free_workers = [worker for worker in workers if not is_worker_active(worker)]
+    free_workers = [worker for worker in workers if is_worker_dispatchable(worker)]
     pending = [item for item in brief.hypothesis_queue if item.status == "pending"]
     dispatched = [item for item in brief.hypothesis_queue if item.status == "dispatched"]
     requested_tools = [tool for tool in registry.tools if tool.status == "requested"]
@@ -1150,8 +1214,8 @@ def render_observer_assignment(
     lines = [
         "# Observer Assignment",
         "",
-        f"Repository: `{ROOT}`",
-        f"Research dir: `{RESEARCH_DIR}`",
+        "Repository: current checkout root",
+        "Research dir: `research`",
         f"Git remote: `{get_origin_remote()}`",
         "",
         "## Fleet",
@@ -1161,6 +1225,8 @@ def render_observer_assignment(
     else:
         lines.extend(describe_worker(worker) for worker in workers)
 
+    lines.extend(["", "## Current Reference Config", f"- `{json.dumps(brief.current_config, sort_keys=True)}`"])
+
     lines.extend(["", "## Dispatch Contract"])
     lines.extend(
         [
@@ -1169,7 +1235,9 @@ def render_observer_assignment(
             "- Set `status` to `dispatched` and `assigned_worker` to the target worker id.",
             "- After edits, run `uv run python orchestrator.py sync` to regenerate assignments.",
             "- When a run is finished, mark the hypothesis `completed` or `abandoned`, add a short `outcome`, and decide keep/discard/crash/replicate for the fleet record.",
-            "- Do not count a run as dashboard-visible until the worker has written `research/plans/<experiment_id>.json` and the full `research/runs/<experiment_id>/` artifact bundle.",
+            "- Do not count a run as dashboard-visible until the worker has written `research/plans/<experiment_id>.json`, `research/plans/<experiment_id>.md`, and the full `research/runs/<experiment_id>/` artifact bundle.",
+            "- The observer stamps the terminal `decision_status` into `result.json`; worker execution status is not the canonical fleet decision.",
+            "- The observer may only reset or advance a worker branch after that worker is idle and has written its execution artifacts for the run.",
             "- Require the finished `result.json` to include `commit`, `parent_commit`, concise `analysis`, and final `metrics.val_bpb`.",
             "- If you need a reusable helper, add a tool request in `research/tools/registry.json` with: `tool_id`, `title`, `problem`, `requested_by`, and `status: requested`.",
         ]
@@ -1208,7 +1276,7 @@ def render_observer_assignment(
     lines.extend(["", "## Worker Inventory"])
     for worker in manifest.workers:
         lines.append(
-            f"- `{worker.worker_id}` branch=`{worker.branch}` worktree=`{worker.worktree_path}`"
+            f"- `{worker.worker_id}` branch=`{worker.branch}` worktree=`{display_path(Path(worker.worktree_path))}`"
         )
 
     return "\n".join(lines) + "\n"
@@ -1220,8 +1288,8 @@ def render_tool_builder_assignment(registry: ToolRegistry) -> str:
     lines = [
         "# Tool-Builder Assignment",
         "",
-        f"Registry: `{TOOLS_REGISTRY_PATH}`",
-        f"Published dir: `{PUBLISHED_TOOLS_DIR}`",
+        f"Registry: `{display_path(TOOLS_REGISTRY_PATH)}`",
+        f"Published dir: `{display_path(PUBLISHED_TOOLS_DIR)}`",
         "",
         "## Request Contract",
         "- Expect requested entries to include: `tool_id`, `title`, `problem`, `requested_by`, `status: requested`.",
@@ -1255,18 +1323,31 @@ def render_worker_assignment(
     peer_workers = [item for item in workers if item.worker_id != worker.worker_id]
     peer_outcomes = recent_peer_outcomes(experiments, worker.worker_id)
     assigned = hypotheses_for_worker(brief, worker.worker_id)
+    worktree_exists = Path(worker.worktree_path).exists()
 
     lines = [
         f"# Worker Assignment: {worker.worker_id}",
         "",
-        f"Worktree: `{worker.worktree_path}`",
+        f"Worktree: `{display_path(Path(worker.worktree_path))}`",
         f"Branch: `{worker.branch}`",
         f"GPU: `{worker.gpu_id}`",
+        f"Shared research root: `{display_path(RESEARCH_DIR)}`",
         "",
         "## Assignment Source",
         "- Observer dispatch is sourced from `research/research_brief.json`.",
         "- If this file says `Await observer dispatch`, do not invent a new experiment.",
         "- The observer owns the final keep/discard/crash decision unless this assignment explicitly says otherwise.",
+        "- Treat `research/research_brief.json.current_config` as the active reference config for new work.",
+        "",
+        "## Current Reference Config",
+        f"- `{json.dumps(brief.current_config, sort_keys=True)}`",
+        "",
+        "## Worktree Status",
+        (
+            "- Worktree exists and is ready."
+            if worktree_exists
+            else "- Worktree is missing. Do not start this worker until `uv run python orchestrator.py init-fleet --create-worktrees` has recreated it."
+        ),
         "",
         "## Current Assignment",
     ]
@@ -1278,11 +1359,15 @@ def render_worker_assignment(
             lines.append(f"- Title: {item.title}")
             lines.append(f"- Rationale: {item.rationale}")
             lines.append(f"- Config overrides: `{json.dumps(item.config_overrides, sort_keys=True)}`")
+            lines.append("- Before the run: read `research/plans/<experiment_id>.md` as the observer-owned scientific decision note. Do not edit it unless the observer explicitly asks you to.")
+            lines.append("- Before editing `train.py`: record `parent_commit = git rev-parse --short HEAD` in your worktree.")
+            lines.append("- Before training: make a dedicated experiment commit so `commit` and `parent_commit` are unambiguous in the run artifacts.")
             lines.append(
                 f"- Run command: `CUDA_VISIBLE_DEVICES={worker.gpu_id} uv run train.py > run.log 2>&1`"
             )
-            lines.append("- Before the run: choose a unique `experiment_id` like `exp-YYYYMMDD-HHMMSS-worker-gpu0` and create `research/plans/<experiment_id>.json` plus `research/runs/<experiment_id>/`.")
-            lines.append("- After the run: write `config.json`, `metadata.json`, `events.jsonl`, and `result.json` with `commit`, `parent_commit`, concise `analysis`, optional `outcome`, and final metrics.")
+            lines.append("- Before the run: confirm the observer has already created the matching `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md`; create only `research/runs/<experiment_id>/` for execution artifacts.")
+            lines.append("- After the run: write `config.json`, `metadata.json`, `events.jsonl`, and `result.json` with `commit`, `parent_commit`, concise `analysis`, optional `outcome`, execution `status` (`completed` or `failed`), and final metrics. Treat the terminal fleet decision as provisional until the observer stamps `decision_status`.")
+            lines.append("- After writing execution artifacts: stop and wait. Do not reset or advance the branch until the observer's next decision is visible in shared state.")
             lines.append("- The `/history` page is derived from these run artifacts after `uv run python orchestrator.py sync`; skipped artifacts mean an invisible run.")
             lines.append("- Report metrics, logs, and your interpretation back to shared state; do not self-dispatch a follow-up family.")
             if item.outcome:
@@ -1383,9 +1468,10 @@ def sync_artifacts() -> dict[str, Any]:
     experiments = collect_experiments()
     live_workers = read_live_workers()
     workers = materialize_fleet_workers(manifest, live_workers)
-    rows = effective_result_rows(experiments)
+    rows = planning_result_rows(experiments)
+    write_results_tsv(rows)
     experiment_records = build_experiment_records(experiments)
-    brief = build_research_brief(rows)
+    brief = build_research_brief(experiments)
     brief.save(BRIEF_PATH)
 
     write_json(EXPERIMENTS_PATH, {"experiments": [item.to_dict() for item in experiments]})
@@ -1397,7 +1483,7 @@ def sync_artifacts() -> dict[str, Any]:
         "generated_at": utc_now_iso(),
         "workers": [worker.to_dict() for worker in workers],
         "active_runs": [worker.run_id for worker in workers if is_worker_active(worker) and worker.run_id],
-        "free_workers": [worker.worker_id for worker in workers if not is_worker_active(worker)],
+        "free_workers": [worker.worker_id for worker in workers if is_worker_dispatchable(worker)],
         "best_result": None,
         "paths": {
             "results_tsv": str(RESULTS_TSV_PATH),
@@ -1797,7 +1883,7 @@ def main() -> None:
     AGGREGATE_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.command == "briefing":
-        brief = build_research_brief(effective_result_rows(collect_experiments()))
+        brief = build_research_brief(collect_experiments())
         brief.save(BRIEF_PATH)
         print(f"Wrote research brief to {BRIEF_PATH.relative_to(ROOT)}")
         return

@@ -326,6 +326,19 @@ a { color: inherit; }
   font-size: 12px;
 }
 
+.decision-md {
+  margin-top: 12px;
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(0, 0, 0, 0.2);
+  overflow: auto;
+  max-height: 340px;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 .link-card {
   display: grid;
   gap: 10px;
@@ -494,7 +507,7 @@ HISTORY_BODY = """
 
     <aside class="panel detail-panel">
       <div class="section-title">Experiment Detail</div>
-      <div id="detail-empty" class="empty">Select a node to inspect lineage, hyperparameter deltas, rationale, and outcome.</div>
+      <div id="detail-empty" class="empty">Select a node to inspect lineage, hyperparameter deltas, the scientific decision note, rationale, and outcome.</div>
       <div id="detail" hidden></div>
     </aside>
   </div>
@@ -645,6 +658,8 @@ async function showDetail(exp) {
     ['Commit', `<span class="mono">${escapeHtml(exp.commit || 'unknown')}</span>`],
     ['Parent', `<span class="mono">${escapeHtml(exp.parent_commit || 'root')}</span>`],
     ['Timestamp', escapeHtml(exp.timestamp || 'n/a')],
+    ['Execution', escapeHtml(exp.execution_status || 'n/a')],
+    ['Decision', escapeHtml(exp.decision_status || exp.status || 'n/a')],
     ['Worker', escapeHtml(exp.worker_id || 'n/a')],
     ['GPU', escapeHtml(exp.gpu_name || (exp.gpu_id ? 'GPU ' + exp.gpu_id : 'n/a'))],
     ['Hypothesis', escapeHtml(exp.hypothesis_id || 'n/a')],
@@ -668,6 +683,13 @@ async function showDetail(exp) {
       ${exp.rationale ? `<div class="muted" style="margin-top:10px;"><strong>Rationale:</strong> ${escapeHtml(exp.rationale)}</div>` : ''}
       ${exp.outcome ? `<div class="muted" style="margin-top:10px;"><strong>Outcome:</strong> ${escapeHtml(exp.outcome)}</div>` : ''}
       ${exp.notes ? `<div class="muted" style="margin-top:10px;"><strong>Notes:</strong> ${escapeHtml(exp.notes)}</div>` : ''}
+    </div>
+
+    <div class="detail-block">
+      <div class="section-title">Scientific Decision Markdown</div>
+      <div class="muted" id="decision-path">Loading decision.md path...</div>
+      <button class="diff-toggle" id="decision-toggle" type="button">Load decision.md</button>
+      <pre class="decision-md" id="decision-md" hidden></pre>
     </div>
 
     <div class="detail-block">
@@ -728,6 +750,37 @@ async function showDetail(exp) {
       diff.textContent = 'Failed to load diff.';
     }
   });
+
+  document.getElementById('decision-toggle').addEventListener('click', async () => {
+    const md = document.getElementById('decision-md');
+    if (!md.hidden) {
+      md.hidden = true;
+      return;
+    }
+    md.textContent = 'Loading decision markdown...';
+    md.hidden = false;
+    try {
+      const res = await fetch(`/api/experiments/${exp.id}/decision-md`);
+      const payload = res.ok ? await res.json() : { content: '', path: '' };
+      const pathEl = document.getElementById('decision-path');
+      pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
+      md.textContent = payload.content || 'No scientific decision markdown available for this run.';
+    } catch (error) {
+      md.textContent = 'Failed to load decision markdown.';
+    }
+  });
+
+  (async () => {
+    try {
+      const res = await fetch(`/api/experiments/${exp.id}/decision-md`);
+      const payload = res.ok ? await res.json() : {};
+      const pathEl = document.getElementById('decision-path');
+      pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
+    } catch (error) {
+      const pathEl = document.getElementById('decision-path');
+      pathEl.textContent = 'Failed to load decision markdown path.';
+    }
+  })();
 
   renderGraph();
 }
@@ -861,6 +914,122 @@ def _load_records() -> list[dict]:
     return records
 
 
+def _load_record(exp_id: int) -> dict | None:
+    for record in _load_records():
+        if record.get("id") == exp_id:
+            return record
+    return None
+
+
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _relative_or_absolute(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _find_run_dir_for_commit(commit: str) -> tuple[Path, dict, dict] | None:
+    if not commit:
+        return None
+    runs_dir = REPO_ROOT / "research" / "runs"
+    if not runs_dir.exists():
+        return None
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        result = _read_json(run_dir / "result.json")
+        metadata = _read_json(run_dir / "metadata.json")
+        result_commit = result.get("commit") or metadata.get("runtime", {}).get("commit")
+        if result_commit == commit:
+            return run_dir, result, metadata
+    return None
+
+
+def _decision_markdown_for_record(record: dict) -> dict:
+    inline_content = record.get("decision_markdown") or ""
+    inline_path = record.get("decision_markdown_path") or ""
+    if inline_content or inline_path:
+        resolved_path = ""
+        if inline_path:
+            candidate = Path(inline_path)
+            if not candidate.is_absolute():
+                candidate = REPO_ROOT / candidate
+            resolved_path = _relative_or_absolute(candidate)
+            if not inline_content and candidate.exists():
+                inline_content = candidate.read_text()
+        return {
+            "exists": bool(inline_content),
+            "path": resolved_path,
+            "content": inline_content,
+            "commit": record.get("commit", ""),
+        }
+
+    commit = record.get("commit", "")
+    match = _find_run_dir_for_commit(commit)
+    if match is None:
+        return {
+            "exists": False,
+            "path": "",
+            "content": "",
+            "commit": commit,
+        }
+
+    run_dir, result, metadata = match
+    candidate_paths: list[Path] = []
+
+    for payload in (result, metadata):
+        for key in ("decision_md_path", "decision_markdown_path"):
+            raw_path = payload.get(key)
+            if not raw_path:
+                continue
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = REPO_ROOT / candidate
+            candidate_paths.append(candidate)
+
+    candidate_paths.extend(
+        [
+            run_dir / "decision.md",
+            run_dir / "scientific-decision.md",
+            run_dir / "decision-note.md",
+            REPO_ROOT / "research" / "plans" / f"{run_dir.name}.md",
+        ]
+    )
+
+    seen: set[str] = set()
+    for path in candidate_paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            return {
+                "exists": True,
+                "path": _relative_or_absolute(path),
+                "content": path.read_text(),
+                "commit": commit,
+                "run_id": run_dir.name,
+            }
+
+    fallback = candidate_paths[0] if candidate_paths else run_dir / "decision.md"
+    return {
+        "exists": False,
+        "path": _relative_or_absolute(fallback),
+        "content": "",
+        "commit": commit,
+        "run_id": run_dir.name,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return _page("Autoresearch Dashboard", INDEX_BODY, INDEX_SCRIPT)
@@ -905,3 +1074,11 @@ def get_diff(exp_id: int):
             return {"diff": ""}
         return {"diff": result.stdout or ""}
     return JSONResponse(status_code=404, content={"error": "not found"})
+
+
+@app.get("/api/experiments/{exp_id}/decision-md")
+def get_decision_markdown(exp_id: int):
+    record = _load_record(exp_id)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return _decision_markdown_for_record(record)
