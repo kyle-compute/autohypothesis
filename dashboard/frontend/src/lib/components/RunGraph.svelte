@@ -59,6 +59,23 @@
 		kept: boolean;
 	}
 
+	// Pre-build lookup maps for O(1) parent resolution
+	let commitMap = $derived.by(() => {
+		const map = new Map<string, Experiment>();
+		for (const e of experiments) map.set(e.commit, e);
+		return map;
+	});
+	let childrenMap = $derived.by(() => {
+		const map = new Map<string, Experiment[]>();
+		for (const e of experiments) {
+			if (!e.parent_commit) continue;
+			const arr = map.get(e.parent_commit) || [];
+			arr.push(e);
+			map.set(e.parent_commit, arr);
+		}
+		return map;
+	});
+
 	let graphNodes = $derived.by((): GNode[] => {
 		if (experiments.length === 0) return [];
 
@@ -73,7 +90,7 @@
 		const maxId = Math.max(...ids);
 		const idRange = maxId - minId || 1;
 
-		const gw = Math.max(width * 1.2, (maxId - minId + 1) * 120);
+		const gw = Math.max(width * 1.2, (maxId - minId + 1) * 80);
 		const gh = Math.max(height * 0.9, 500);
 
 		return experiments.map(exp => {
@@ -84,8 +101,7 @@
 			const isCrash = exp.status === 'crash';
 			const r = isKeep ? R_KEEP : isCrash ? R_CRASH : R_DISCARD;
 
-			// Param diff vs parent
-			const parent = experiments.find(p => p.commit === exp.parent_commit);
+			const parent = commitMap.get(exp.parent_commit);
 			const paramChanges: ParamChange[] = [];
 			if (parent) {
 				for (const key of HYPERPARAM_KEYS) {
@@ -110,40 +126,44 @@
 
 	let graphEdges = $derived.by((): GEdge[] => {
 		const nodeByCommit = new Map<string, GNode>();
+		for (const n of graphNodes) nodeByCommit.set(n.exp.commit, n);
+		const edges: GEdge[] = [];
 		for (const n of graphNodes) {
-			nodeByCommit.set(n.exp.commit, n);
-		}
-		return graphNodes
-			.filter(n => n.exp.parent_commit && nodeByCommit.has(n.exp.parent_commit))
-			.map(n => {
-				const p = nodeByCommit.get(n.exp.parent_commit)!;
-				const dx = n.x - p.x;
-				return {
-					fromId: p.id,
-					toId: n.id,
-					path: `M${p.x},${p.y} C${p.x + dx * 0.5},${p.y} ${n.x - dx * 0.5},${n.y} ${n.x},${n.y}`,
-					kept: n.exp.status === 'keep',
-				};
+			if (!n.exp.parent_commit) continue;
+			const p = nodeByCommit.get(n.exp.parent_commit);
+			if (!p || p.id === n.id) continue; // skip self-referencing baseline
+			const dx = n.x - p.x;
+			edges.push({
+				fromId: p.id,
+				toId: n.id,
+				path: `M${p.x},${p.y} C${p.x + dx * 0.5},${p.y} ${n.x - dx * 0.5},${n.y} ${n.x},${n.y}`,
+				kept: n.exp.status === 'keep',
 			});
+		}
+		return edges;
 	});
 
-	// Lineage set for highlighting
+	// Lineage set for highlighting (uses lookup maps for O(n) instead of O(n^2))
 	let lineageSet = $derived.by((): Set<number> => {
 		const target = hoveredId ?? selectedId;
 		if (target == null) return new Set();
+		const idMap = new Map<number, Experiment>();
+		for (const e of experiments) idMap.set(e.id, e);
 		const set = new Set<number>();
-		// Walk ancestors by commit chain
-		let cur = experiments.find(e => e.id === target);
+		// Walk ancestors
+		let cur = idMap.get(target);
 		while (cur) {
 			set.add(cur.id);
-			cur = cur.parent_commit ? experiments.find(e => e.commit === cur!.parent_commit) : undefined;
+			cur = cur.parent_commit ? commitMap.get(cur.parent_commit) : undefined;
 		}
 		// Walk descendants
-		const queue = [experiments.find(e => e.id === target)!];
+		const start = idMap.get(target);
+		if (!start) return set;
+		const queue = [start];
 		while (queue.length) {
 			const e = queue.shift()!;
 			set.add(e.id);
-			for (const child of experiments.filter(c => c.parent_commit === e.commit)) {
+			for (const child of (childrenMap.get(e.commit) || [])) {
 				if (!set.has(child.id)) {
 					set.add(child.id);
 					queue.push(child);
@@ -339,7 +359,7 @@
 						font-size={node.exp.status === 'keep' ? '11' : '9'}
 						font-weight="700"
 					>
-						{node.exp.id}
+						{node.id}
 					</text>
 					<text
 						y={node.r + 14}
@@ -367,7 +387,7 @@
 	{#if tooltipNode && hoveredId !== selectedId}
 		<div class="tooltip" style="left: {tooltipX}px; top: {tooltipY - tooltipNode.r * sc - 12}px;">
 			<div class="tt-header">
-				<span class="tt-iter">#{tooltipNode.exp.id}</span>
+				<span class="tt-iter">#{tooltipNode.id}</span>
 				<span class="tt-id">{tooltipNode.exp.commit}</span>
 				<span class="tt-badge {tooltipNode.exp.status}">{tooltipNode.exp.status}</span>
 			</div>
