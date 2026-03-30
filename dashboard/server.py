@@ -946,6 +946,63 @@ def _page(title: str, body: str, script: str) -> str:
 """
 
 
+def _load_aggregate_hyperparams() -> dict[str, dict]:
+    """Load hyperparameters from aggregate/experiments.json, keyed by experiment_id."""
+    agg_path = REPO_ROOT / "research" / "aggregate" / "experiments.json"
+    if not agg_path.exists():
+        return {}
+    try:
+        data = json.loads(agg_path.read_text())
+        result = {}
+        for exp in data.get("experiments", []):
+            hp = exp.get("config", {}).get("hyperparameters")
+            if hp:
+                result[exp["experiment_id"]] = hp
+        return result
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def _enrich_record(record: dict, agg_hp: dict[str, dict]) -> None:
+    """Enrich a record with data from metadata.json and aggregate hyperparams."""
+    exp_id = record.get("id", "")
+    run_dir = REPO_ROOT / "research" / "runs" / exp_id
+
+    # Enrich metrics from metadata.json
+    meta_path = run_dir / "metadata.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            results = meta.get("results", {})
+            # Fill zero metrics from metadata results
+            metric_keys = [
+                "num_steps", "training_seconds", "total_seconds",
+                "mfu_percent", "total_tokens_M", "num_params_M",
+            ]
+            for key in metric_keys:
+                if not record.get(key) and results.get(key):
+                    record[key] = results[key]
+            # peak_vram: metadata uses MB, record uses GB
+            if not record.get("peak_vram_gb") and results.get("peak_vram_mb"):
+                record["peak_vram_gb"] = results["peak_vram_mb"] / 1024
+            # depth
+            if not record.get("depth") and results.get("depth"):
+                record["depth"] = results["depth"]
+            # Attach hyperparameters
+            if meta.get("hyperparameters"):
+                record["hyperparameters"] = meta["hyperparameters"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Fallback hyperparameters from aggregate
+    if not record.get("hyperparameters") and exp_id in agg_hp:
+        record["hyperparameters"] = agg_hp[exp_id]
+
+    # Ensure hyperparameters key exists
+    if "hyperparameters" not in record:
+        record["hyperparameters"] = {}
+
+
 def _load_records() -> list[dict]:
     if not EXPERIMENTS_FILE.exists():
         return []
@@ -958,6 +1015,12 @@ def _load_records() -> list[dict]:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    # Enrich records with metadata
+    agg_hp = _load_aggregate_hyperparams()
+    for record in records:
+        _enrich_record(record, agg_hp)
+
     records.sort(
         key=lambda item: (
             item.get("ordinal", 0),
@@ -1136,3 +1199,53 @@ def get_decision_markdown(exp_id: str):
     if record is None:
         return JSONResponse(status_code=404, content={"error": "not found"})
     return _decision_markdown_for_record(record)
+
+
+@app.get("/api/karpathy-comparison")
+def get_karpathy_comparison():
+    csv_path = REPO_ROOT / "research" / "karpathy_comparison.csv"
+    if not csv_path.exists():
+        return []
+    rows = []
+    for line in csv_path.read_text().splitlines()[1:]:  # skip header
+        parts = line.strip().split(",")
+        if len(parts) < 4:
+            continue
+        rows.append({
+            "experiment": parts[0],
+            "karpathy_bpb": float(parts[1]),
+            "our_bpb": float(parts[2]),
+            "delta": parts[3],
+        })
+    return rows
+
+
+@app.get("/api/karpathy-original")
+def get_karpathy_original():
+    tsv_path = REPO_ROOT / "research" / "karpathy_original_results.tsv"
+    if not tsv_path.exists():
+        return []
+    rows = []
+    best = float("inf")
+    for line in tsv_path.read_text().splitlines()[1:]:  # skip header
+        parts = line.strip().split("\t")
+        if len(parts) < 5:
+            continue
+        try:
+            bpb = float(parts[1])
+        except ValueError:
+            continue
+        if bpb <= 0:
+            continue
+        status = parts[3]
+        if status == "keep" and bpb < best:
+            best = bpb
+        rows.append({
+            "commit": parts[0],
+            "val_bpb": bpb,
+            "memory_gb": float(parts[2]) if parts[2] else 0,
+            "status": status,
+            "description": parts[4] if len(parts) > 4 else "",
+            "best_so_far": min(best, bpb) if best < float("inf") else bpb,
+        })
+    return rows

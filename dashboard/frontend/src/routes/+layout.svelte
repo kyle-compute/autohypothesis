@@ -23,6 +23,13 @@
 				</svg>
 				Decisions
 			</a>
+			<a href="/tree" class="nav-link">
+				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="8" cy="3" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/>
+					<line x1="8" y1="5" x2="4" y2="10"/><line x1="8" y1="5" x2="12" y2="10"/>
+				</svg>
+				Tree
+			</a>
 		</div>
 	</div>
 </nav>
