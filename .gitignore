@@ -19,8 +19,13 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results / experiment data
 results.tsv
 experiments.jsonl
 research/
 run.log
+
+# Dashboard frontend
+dashboard/frontend/node_modules/
+dashboard/frontend/build/
+dashboard/frontend/.svelte-kit/
