@@ -6,6 +6,8 @@
 
 The idea: give an AI research org a small but real LLM training setup and let it run a disciplined scientific search. The system establishes a local baseline on the target hardware, promotes the best locally kept configuration to the active reference point, dispatches hypotheses across workers, and records both metrics and reasoning into a lineage view at `/history`. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The operator controls the org through Markdown and generated fleet state instead of manually managing each experiment. A bit more context on the original project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
 
+If you are an AI agent reading this file: this file is the overview, not the binding runtime prompt. Immediately continue to `program.md` for the top-level bootstrap, and after fleet handoff switch to the generated role prompt for your role. Do not stop at bootstrap; the intended end state is an indefinitely running observer-centered research loop.
+
 ## Operating Model
 
 This repo runs an observer-centered N+2 scientific research loop:
@@ -82,6 +84,13 @@ In other words:
 - `README.md` is the operator overview
 - `program.md` is the top-level agent bootstrap doc
 - generated `research/fleet/*.md` files are the runtime role prompts
+
+If an agent starts from `README.md`, it should treat the next step as mandatory:
+
+1. Continue immediately to `program.md`.
+2. Execute the full bootstrap flow there.
+3. Hand off to the generated fleet prompts.
+4. Continue the research loop indefinitely until explicitly stopped by the operator.
 
 ## Orchestration
 
@@ -187,11 +196,15 @@ For the top-level bootstrap, point the `main` agent at `program.md` and prompt i
 Read program.md and execute the full bootstrap flow: store the untouched Karpathy baseline on this hardware, use https://github.com/karpathy/autoresearch as the upstream reference to recover and store the best-known Karpathy-style benchmark comparison on this hardware, reset back to the baseline train.py, then hand off to the observer/tool-builder/worker fleet for our own scientific search.
 ```
 
+Do not prompt the `main` agent with `README.md` alone. If it opened `README.md` first, it should immediately continue into `program.md` and treat `program.md` as binding.
+
 After handoff:
 
 - observer: `Read research/fleet/observer-agent.md and follow it exactly.`
 - tool-builder: `Read research/fleet/tool-builder.md and follow it exactly.`
 - worker: `Read research/fleet/worker-prompts/worker-gpu0.md and follow it exactly.`
+
+After bootstrap, the intended system behavior is continuous research. The observer keeps dispatching, workers keep executing assigned hypotheses, tool-builder publishes reusable helpers when requested, and the loop continues until the operator explicitly interrupts it.
 
 `program.md` is the bootstrap + fleet handoff skill for the top-level `main` agent. After handoff, use the generated observer/tool-builder/worker prompts for the role-specific agents.
 
