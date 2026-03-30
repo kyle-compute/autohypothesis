@@ -14,10 +14,10 @@ The repo is deliberately kept small and only really has three files that matter 
 - **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
-This repo also includes an optional orchestration layer for config-driven runs:
+This repo also includes an optional orchestration layer for fleet runs:
 
-- **`scientific_process.py`** — experiment config and result schemas.
-- **`orchestrator.py`** — generates briefs and experiment plans, and records outcomes into `research/`.
+- **`schema.py`** — experiment, fleet, and hypothesis schemas.
+- **`orchestrator.py`** — generates briefs, prompts, and shared fleet state under `research/`.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
@@ -25,7 +25,7 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU. This path is aimed at A100-SXM4 or H100-class cards on Vast.ai, Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** At least one NVIDIA GPU. The base loop works on a single GPU; the fleet path scales to multiple GPUs. This repo is aimed at A100-SXM4 and H100-class boxes on Vast.ai, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 
@@ -44,66 +44,30 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
-## Scientific orchestration
+## Orchestration
 
-If you want the MLX fork's explicit planning loop on CUDA, use the added orchestrator:
+The orchestrator tracks fleet state and experiment outcomes:
 
 ```bash
-# summarize current repo state and hypothesis queue
+# summarize current repo state
 uv run python orchestrator.py briefing
 
-# write the next experiment config and plan
-uv run python orchestrator.py plan
-
-# execute the planned run on your GPU
-uv run train.py --config research/runs/exp-0001/config.json --metadata-out research/runs/exp-0001/metadata.json
-
-# record the outcome back into the knowledge base
-uv run python orchestrator.py record \
-  --plan research/plans/exp-0001.json \
-  --metadata research/runs/exp-0001/metadata.json \
-  --status keep \
-  --analysis "Experiment beat the baseline on A100-SXM4 and matched the step-efficiency hypothesis."
-```
-
-`train.py` still works as the old single-command entrypoint. The extra CLI flags only make it possible for `orchestrator.py` to drive runs and save structured metadata.
-
-## Live observability
-
-The orchestration layer now keeps both historical and live state:
-
-- `research/runs/<run_id>/events.jsonl` — append-only run event log
-- `research/live/workers/<worker_id>.json` — latest live status for each GPU worker
-- `research/live/summary.json` — materialized cluster summary
-- `research/aggregate/experiments.json` — normalized aggregate run index
-- `results.tsv` — derived compatibility view for the original notebook/chart flow
-
-Useful commands:
-
-```bash
-# rebuild aggregate artifacts from event logs
+# rebuild aggregate artifacts from run logs
 uv run python orchestrator.py sync
 
 # inspect live workers and current best result
 uv run python orchestrator.py status
-
-# launch one planned run per free GPU
-uv run python orchestrator.py dispatch
-
-# preview dispatch commands without launching
-uv run python orchestrator.py dispatch --dry-run
 ```
 
-`dispatch` assumes one training run per GPU. It detects available GPUs with `nvidia-smi`, assigns one worker per free GPU, and launches `train.py` with live heartbeat telemetry enabled.
+In single-agent mode, the agent decides what experiments to run and logs results to `results.tsv`. In fleet mode, the observer controls dispatch and workers execute assigned hypotheses.
 
 ## Agent Fleet
 
-For a main-agent plus multi-worker setup, initialize a fleet manifest and one worktree per GPU.
+For an observer + tool-builder + multi-worker setup, initialize a fleet manifest and one worktree per GPU.
 
-If you are bringing this up on the actual A100 node, read [`A100_HANDOFF.md`](A100_HANDOFF.md) first. It is the deployment verification checklist for the 2-worker fleet.
 If you temporarily remove `.git` while reorganizing the repo, the orchestration layer still works, but `--create-worktrees` is intentionally disabled until you run `git init` and create a baseline commit again.
 
-For your target setup on a 2x A100-SXM4 node, the shortest working path is:
+For a multi-GPU setup, the shortest working path is:
 
 ```bash
 # create a 2-worker fleet and generate prompts/worktrees
@@ -118,30 +82,32 @@ uv run python orchestrator.py monitor --interval 5
 # inspect live worker state
 uv run python orchestrator.py status
 
-# dispatch one planned experiment per free worker
-uv run python orchestrator.py dispatch
 ```
 
 What this gives you:
 
-- `research/fleet/main-agent.md` — prompt for the root meta-agent
-- `research/fleet/worker-prompts/worker-gpu*.md` — prompt for each worker agent
+- `research/fleet/observer-agent.md` — start prompt for the observer
+- `research/fleet/tool-builder.md` — start prompt for the tool-builder
+- `research/fleet/worker-prompts/worker-gpu*.md` — start prompt for each GPU worker
+- `research/fleet/assignments/` and `research/fleet/protocols/` — generated Markdown contracts for every role
 - `worktrees/worker-gpu*` — isolated git worktrees so parallel agents can edit `train.py` without conflicts
-- shared `research/` state that every worker reads before choosing its next experiment
+- shared `research/` state that every worker reads before running
 
 The intended loop is:
 
-1. Run one main agent in the repo root using `research/fleet/main-agent.md`.
-2. Run one worker agent per GPU in its corresponding `worktrees/worker-gpu*` directory.
-3. Keep `uv run python orchestrator.py monitor --interval 5` running in the repo root so the shared briefs stay current.
-4. Let workers monitor `research/live/*` and `research/aggregate/*` so they learn from each other's runs before editing again.
+1. Run one observer agent in the repo root using `research/fleet/observer-agent.md`.
+2. Run one tool-builder agent in the repo root using `research/fleet/tool-builder.md`.
+3. Run one worker agent per GPU in its corresponding `worktrees/worker-gpu*` directory.
+4. Keep `uv run python orchestrator.py monitor --interval 5` running in the repo root so the shared briefs stay current.
+5. The observer edits `research/research_brief.json` to dispatch hypotheses, then runs `sync` to regenerate worker assignments.
 
 Recommended terminal layout on a 2x A100 box:
 
 1. Terminal 1: repo root, run `uv run python orchestrator.py monitor --interval 5`
-2. Terminal 2: repo root, run the main/meta agent using `research/fleet/main-agent.md`
-3. Terminal 3: `worktrees/worker-gpu0`, run worker agent 0 using its generated prompt
-4. Terminal 4: `worktrees/worker-gpu1`, run worker agent 1 using its generated prompt
+2. Terminal 2: repo root, run the observer using `research/fleet/observer-agent.md`
+3. Terminal 3: repo root, run the tool-builder using `research/fleet/tool-builder.md`
+4. Terminal 4: `worktrees/worker-gpu0`, run worker agent 0 using its generated prompt
+5. Terminal 5: `worktrees/worker-gpu1`, run worker agent 1 using its generated prompt
 
 ## Running the agent
 
@@ -159,8 +125,8 @@ The `program.md` file is essentially a super lightweight "skill".
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
-scientific_process.py — experiment schemas and JSON helpers
-orchestrator.py — planning/recording layer for autonomous experiments
+schema.py       — experiment, fleet, and hypothesis schemas
+orchestrator.py — fleet state tracking and prompt generation for multi-GPU setups
 pyproject.toml  — dependencies
 ```
 

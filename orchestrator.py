@@ -14,20 +14,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from scientific_process import (
+from schema import (
     AggregateExperiment,
     EmpiricalFinding,
     ExperimentConfig,
-    ExperimentPlan,
-    ExperimentResult,
     FleetManifest,
     FleetWorker,
     Hypothesis,
     KnowledgeBase,
     ResearchBrief,
     ResultRow,
+    ToolEntry,
+    ToolRegistry,
     WorkerStatus,
-    append_jsonl,
     read_jsonl,
     utc_now_iso,
     write_json,
@@ -38,6 +37,7 @@ ROOT = Path(__file__).resolve().parent
 RESEARCH_DIR = ROOT / "research"
 BRIEF_PATH = RESEARCH_DIR / "research_brief.json"
 KNOWLEDGE_PATH = RESEARCH_DIR / "knowledge_base.json"
+SEARCH_MODEL_PATH = RESEARCH_DIR / "search_model.md"
 PLANS_DIR = RESEARCH_DIR / "plans"
 RUNS_DIR = RESEARCH_DIR / "runs"
 LIVE_DIR = RESEARCH_DIR / "live"
@@ -48,12 +48,26 @@ EXPERIMENTS_PATH = AGGREGATE_DIR / "experiments.json"
 LEADERBOARD_PATH = AGGREGATE_DIR / "leaderboard.json"
 FLEET_DIR = RESEARCH_DIR / "fleet"
 FLEET_MANIFEST_PATH = FLEET_DIR / "manifest.json"
-MAIN_AGENT_PROMPT_PATH = FLEET_DIR / "main-agent.md"
+LEGACY_MAIN_AGENT_PROMPT_PATH = FLEET_DIR / "main-agent.md"
+OBSERVER_PROMPT_PATH = FLEET_DIR / "observer-agent.md"
+TOOL_BUILDER_PROMPT_PATH = FLEET_DIR / "tool-builder.md"
 WORKER_PROMPTS_DIR = FLEET_DIR / "worker-prompts"
+FLEET_PROTOCOLS_DIR = FLEET_DIR / "protocols"
+FLEET_ASSIGNMENTS_DIR = FLEET_DIR / "assignments"
+WORKER_ASSIGNMENTS_DIR = FLEET_ASSIGNMENTS_DIR / "workers"
+OBSERVER_ASSIGNMENT_PATH = FLEET_ASSIGNMENTS_DIR / "observer.md"
+TOOL_BUILDER_ASSIGNMENT_PATH = FLEET_ASSIGNMENTS_DIR / "tool-builder.md"
+OBSERVER_PROTOCOL_PATH = FLEET_PROTOCOLS_DIR / "observer.md"
+TOOL_BUILDER_PROTOCOL_PATH = FLEET_PROTOCOLS_DIR / "tool-builder.md"
+GPU_WORKER_PROTOCOL_PATH = FLEET_PROTOCOLS_DIR / "gpu-worker.md"
 FLEET_BRIEF_PATH = AGGREGATE_DIR / "fleet_brief.md"
+TOOLS_DIR = RESEARCH_DIR / "tools"
+PUBLISHED_TOOLS_DIR = TOOLS_DIR / "published"
+TOOLS_REGISTRY_PATH = TOOLS_DIR / "registry.json"
 RESULTS_TSV_PATH = ROOT / "results.tsv"
 PROGRESS_PNG_PATH = ROOT / "progress.png"
 STALE_HEARTBEAT_SECONDS = 180.0
+CACHE_DIR = Path.home() / ".cache" / "autoresearch"
 
 
 def has_git_metadata() -> bool:
@@ -118,22 +132,39 @@ def load_fleet_manifest() -> FleetManifest | None:
     payload = load_json(FLEET_MANIFEST_PATH)
     if payload is None:
         return None
-    workers = [FleetWorker(**item) for item in payload.get("workers", [])]
-    return FleetManifest(
-        tag=payload["tag"],
-        created_at=payload["created_at"],
-        repository_root=payload["repository_root"],
-        shared_research_dir=payload["shared_research_dir"],
-        main_prompt_path=payload["main_prompt_path"],
-        workers=workers,
-    )
+    try:
+        manifest = FleetManifest.from_dict(payload)
+    except Exception:
+        workers = [FleetWorker.from_dict(item) for item in payload.get("workers", [])]
+        manifest = FleetManifest(
+            tag=payload["tag"],
+            created_at=payload["created_at"],
+            repository_root=payload["repository_root"],
+            shared_research_dir=payload["shared_research_dir"],
+            observer_prompt_path=payload.get("observer_prompt_path")
+            or payload.get("main_prompt_path")
+            or str(OBSERVER_PROMPT_PATH),
+            tool_builder_prompt_path=payload.get("tool_builder_prompt_path")
+            or str(TOOL_BUILDER_PROMPT_PATH),
+            workers=workers,
+            main_prompt_path=payload.get("main_prompt_path", str(LEGACY_MAIN_AGENT_PROMPT_PATH)),
+        )
+    if not manifest.observer_prompt_path:
+        manifest.observer_prompt_path = str(OBSERVER_PROMPT_PATH)
+    if Path(manifest.observer_prompt_path).name == "main-agent.md":
+        manifest.observer_prompt_path = str(OBSERVER_PROMPT_PATH)
+    if not manifest.tool_builder_prompt_path:
+        manifest.tool_builder_prompt_path = str(TOOL_BUILDER_PROMPT_PATH)
+    if not manifest.main_prompt_path:
+        manifest.main_prompt_path = str(LEGACY_MAIN_AGENT_PROMPT_PATH)
+    return manifest
 
 
 def save_fleet_manifest(manifest: FleetManifest) -> None:
     write_json(FLEET_MANIFEST_PATH, manifest.to_dict())
 
 
-def write_results_tsv(rows: list[dict[str, Any]]) -> None:
+def write_results_tsv(rows: list[ResultRow]) -> None:
     RESULTS_TSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     with RESULTS_TSV_PATH.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
@@ -141,11 +172,11 @@ def write_results_tsv(rows: list[dict[str, Any]]) -> None:
         for row in rows:
             writer.writerow(
                 [
-                    row["commit"],
-                    f"{row['val_bpb']:.6f}",
-                    f"{row['memory_gb']:.1f}",
-                    row["status"],
-                    row["description"],
+                    row.commit,
+                    f"{row.val_bpb:.6f}",
+                    f"{row.memory_gb:.1f}",
+                    row.status,
+                    row.description,
                 ]
             )
 
@@ -221,9 +252,7 @@ def summarize_findings(rows: list[ResultRow]) -> list[EmpiricalFinding]:
     return findings
 
 
-def extract_open_questions(
-    rows: list[ResultRow], config: ExperimentConfig
-) -> list[str]:
+def extract_open_questions(rows: list[ResultRow], config: ExperimentConfig) -> list[str]:
     descriptions = " ".join(row.description.lower() for row in rows)
     questions = []
     if "window" not in descriptions:
@@ -249,163 +278,167 @@ def extract_open_questions(
     return questions
 
 
-def hypothesis_templates(
-    config: ExperimentConfig, rows: list[ResultRow]
-) -> list[Hypothesis]:
-    baseline = best_result(rows)
-    baseline_bpb = baseline.val_bpb if baseline is not None else math.inf
-    history_text = " ".join(row.description.lower() for row in rows)
-    hypotheses: list[Hypothesis] = []
+def make_hypothesis_id(title: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in title)
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug[:48] or "hypothesis"
 
-    alt_window = "SLSL" if config.window_pattern != "SLSL" else "LSSL"
-    hypotheses.append(
-        Hypothesis(
-            hypothesis_id="window-pattern-balance",
-            title="Test a more balanced attention pattern",
-            question="Can alternating local/global attention improve information flow more than the current grouped pattern?",
-            why_now="Window pattern is a first-class architecture knob in `train.py`, but results history has not probed it yet.",
-            rationale=(
-                f"Current pattern `{config.window_pattern}` groups short windows. Testing `{alt_window}` probes whether alternating "
-                "long-range access improves quality without changing parameter count."
-            ),
-            intervention={"window_pattern": alt_window},
-            expected_effect={
-                "val_bpb_direction": "down",
-                "val_bpb_delta": "0.00 to -0.08",
-                "num_steps_direction": "flat",
-                "peak_vram_mb_direction": "flat",
-            },
-            success_criteria=f"Beat the current best val_bpb {baseline_bpb:.6f} without materially increasing memory.",
-            alternative_explanations=[
-                "Any gain may come from better optimization dynamics rather than better context mixing.",
-                "A flat result may mean depth, not windowing, is the active bottleneck.",
-            ],
-            follow_if_supported=[
-                "Test a second window family to map the local/global tradeoff.",
-                "Combine the stronger pattern with a schedule change.",
-            ],
-            follow_if_not_supported=[
-                "Stop spending budget on window patterns and switch to throughput or width.",
-            ],
-            confidence="medium",
-            scientific_value="High information gain because it isolates an untested architectural mechanism.",
-            family="architecture",
-            score=0.76,
+
+def suggested_hypotheses(rows: list[ResultRow], config: ExperimentConfig) -> list[Hypothesis]:
+    descriptions = " ".join(row.description.lower() for row in rows)
+    suggestions: list[Hypothesis] = []
+
+    def add(title: str, rationale: str, config_overrides: dict[str, Any], priority: int) -> None:
+        suggestions.append(
+            Hypothesis(
+                hypothesis_id=make_hypothesis_id(title),
+                title=title,
+                rationale=rationale,
+                config_overrides=config_overrides,
+                priority=priority,
+            )
         )
+
+    if not rows:
+        add(
+            "Baseline replication",
+            "Establish the reference point before branching the search.",
+            {},
+            100,
+        )
+    if "batch" not in descriptions:
+        add(
+            "Halve total batch size",
+            "Smaller global batches can buy more optimizer steps inside the fixed 300s budget.",
+            {"total_batch_size": max(2**17, config.total_batch_size // 2)},
+            90,
+        )
+    if "depth" not in descriptions:
+        add(
+            "Probe depth +1",
+            "A slightly deeper model may improve quality if step throughput does not collapse.",
+            {"depth": config.depth + 1},
+            80,
+        )
+    if "warm" not in descriptions:
+        add(
+            "Extend warmdown",
+            "The current decay schedule may be too aggressive in the last third of training.",
+            {"warmdown_ratio": min(0.9, round(config.warmdown_ratio + 0.15, 2))},
+            70,
+        )
+    if "window" not in descriptions:
+        next_pattern = "LLLL" if config.window_pattern != "LLLL" else "SSSL"
+        add(
+            "Window-pattern swap",
+            "Attention locality may be the constraint rather than raw width or depth.",
+            {"window_pattern": next_pattern},
+            60,
+        )
+    if "embedding" not in descriptions:
+        add(
+            "Embedding LR sweep",
+            "Embeddings can underfit or destabilize quickly under the fixed-budget regime.",
+            {"embedding_lr": round(config.embedding_lr * 1.2, 4)},
+            50,
+        )
+    return suggestions[:4]
+
+
+def load_existing_brief() -> ResearchBrief | None:
+    payload = load_json(BRIEF_PATH)
+    if payload is None:
+        return None
+    try:
+        return ResearchBrief.from_dict(payload)
+    except Exception:
+        return None
+
+
+def merge_hypothesis_queue(
+    existing: list[Hypothesis] | None, suggestions: list[Hypothesis]
+) -> list[Hypothesis]:
+    queue: list[Hypothesis] = list(existing or [])
+    seen = {item.hypothesis_id for item in queue}
+    for suggestion in suggestions:
+        if suggestion.hypothesis_id in seen:
+            continue
+        queue.append(suggestion)
+        seen.add(suggestion.hypothesis_id)
+        if len(queue) >= 6:
+            break
+    queue.sort(key=lambda item: (-item.priority, item.hypothesis_id))
+    return queue
+
+
+def build_research_brief(rows: list[ResultRow]) -> ResearchBrief:
+    config = ExperimentConfig()
+    best = best_result(rows)
+    best_payload = asdict(best) if best is not None else {}
+    findings = summarize_findings(rows)
+    constraints = [
+        "Only `train.py` is editable during public autoresearch runs; `prepare.py` stays fixed.",
+        "Primary metric is val_bpb from `evaluate_bpb()` on a pinned validation shard.",
+        "Training budget is fixed at 300 seconds, so step-efficiency is part of the objective.",
+        "Experiments must satisfy total_batch_size % (device_batch_size * MAX_SEQ_LEN) == 0.",
+        "Fleet mode uses one worker agent per GPU plus a central observer and optional tool-builder.",
+    ]
+    notes = [
+        f"Generated on host {platform.node()} ({platform.platform()}).",
+        "Observer dispatch lives in `research_brief.json` via `hypothesis_queue`.",
+        "Treat small single-run wins as provisional until replicated.",
+    ]
+    existing = load_existing_brief()
+    hypothesis_queue = merge_hypothesis_queue(
+        existing.hypothesis_queue if existing is not None else None,
+        suggested_hypotheses(rows, config),
+    )
+    return ResearchBrief(
+        generated_at=utc_now_iso(),
+        repository=ROOT.name,
+        objective="Optimize autoregressive pretraining quality under a fixed NVIDIA GPU time budget.",
+        constraints=constraints,
+        current_config=config.to_dict(),
+        best_result=best_payload,
+        findings=findings,
+        open_questions=extract_open_questions(rows, config),
+        hypothesis_queue=hypothesis_queue,
+        notes=notes,
     )
 
-    smaller_batch = max(config.device_batch_size * 2048, config.total_batch_size // 2)
-    if smaller_batch < config.total_batch_size:
-        hypotheses.append(
-            Hypothesis(
-                hypothesis_id="throughput-more-steps",
-                title="Trade batch for more optimizer steps",
-                question="Can a smaller effective batch improve fixed-time quality by increasing step count?",
-                why_now="Fixed-time autoresearch often benefits when extra optimizer steps outweigh noisier gradients.",
-                rationale=(
-                    f"Reducing `TOTAL_BATCH_SIZE` from {config.total_batch_size:,} to {smaller_batch:,} tests whether more updates still dominate "
-                    "any weaker gradient estimate."
-                ),
-                intervention={"total_batch_size": smaller_batch},
-                expected_effect={
-                    "val_bpb_direction": "down",
-                    "val_bpb_delta": "-0.02 to -0.10",
-                    "num_steps_direction": "up",
-                    "peak_vram_mb_direction": "down",
-                },
-                success_criteria="Improve val_bpb while increasing step count enough to support the throughput hypothesis.",
-                alternative_explanations=[
-                    "Any win may be due to implicit regularization from noisier gradients, not just extra steps.",
-                    "A loss may mean the search has already crossed the useful small-batch regime.",
-                ],
-                follow_if_supported=[
-                    "Map the lower-batch frontier with one more reduction or a compensating LR change.",
-                    "Test whether the same step-efficiency mechanism holds at a different depth.",
-                ],
-                follow_if_not_supported=[
-                    "Treat the current batch size as near-optimal and pivot to width or schedule.",
-                ],
-                confidence="medium",
-                scientific_value="Builds directly on an already-supported mechanism and sharpens causal understanding.",
-                family="throughput",
-                score=0.81,
-            )
-        )
 
-    adjusted_depth = max(2, config.depth - 2)
-    if adjusted_depth != config.depth:
-        hypotheses.append(
-            Hypothesis(
-                hypothesis_id="depth-frontier",
-                title="Probe the next shallower depth frontier",
-                question="Has the best model reached the optimal depth/throughput balance yet?",
-                why_now="Depth strongly changes both capacity and throughput, so it is still one of the highest-value knobs.",
-                rationale=(
-                    f"Reducing depth from {config.depth} to {adjusted_depth} isolates whether additional step-efficiency still outweighs capacity loss."
-                ),
-                intervention={"depth": adjusted_depth},
-                expected_effect={
-                    "val_bpb_direction": "mixed",
-                    "val_bpb_delta": "-0.05 to +0.08",
-                    "num_steps_direction": "up",
-                    "peak_vram_mb_direction": "down",
-                },
-                success_criteria="Either produce a clear win or clearly falsify the idea that shallower is still better.",
-                alternative_explanations=[
-                    "If it wins, the dominant mechanism is still throughput rather than representation depth.",
-                    "If it loses, the current depth may already be near the compute-optimal boundary.",
-                ],
-                follow_if_supported=[
-                    "Repeat once to check that the gain is robust and not a narrow artifact.",
-                    "Test whether width can be added back without losing the throughput benefit.",
-                ],
-                follow_if_not_supported=[
-                    "Freeze depth near the current best and explore orthogonal knobs.",
-                ],
-                confidence="medium",
-                scientific_value="Critical causal test of a high-leverage architecture knob.",
-                family="architecture",
-                score=0.72,
-            )
-        )
+def ensure_search_model() -> None:
+    if SEARCH_MODEL_PATH.exists():
+        return
+    write_text(
+        SEARCH_MODEL_PATH,
+        (
+            "# Search Model\n\n"
+            "This file is the observer's persistent scratchpad.\n"
+            "Update it after every dispatch cycle.\n\n"
+            "## Active Theory\n\n"
+            "- Describe the current mechanism you believe drives val_bpb.\n\n"
+            "## Search Phase\n\n"
+            "- broad-exploration | focused-exploitation | diminishing-returns | stuck\n\n"
+            "## Dimension Beliefs\n\n"
+            "- depth:\n"
+            "- window_pattern:\n"
+            "- total_batch_size:\n"
+            "- embedding_lr:\n"
+            "- warmdown_ratio:\n\n"
+            "## Next Dispatches\n\n"
+            "- Keep 1-4 hypotheses here that map onto `research_brief.json`.\n"
+            "- If only one worker is available, one planned experiment is sufficient.\n"
+        ),
+    )
 
-    if "warmdown" not in history_text and "anneal" not in history_text:
-        new_warmdown = 0.65 if config.warmdown_ratio < 0.65 else 0.35
-        hypotheses.append(
-            Hypothesis(
-                hypothesis_id="schedule-tail-control",
-                title="Reshape the late-training anneal",
-                question="Does a different late-training schedule improve how the fixed budget is spent?",
-                why_now="Schedule shape affects every experiment but has not been isolated in the current history.",
-                rationale=(
-                    f"Changing `WARMDOWN_RATIO` from {config.warmdown_ratio:.2f} to {new_warmdown:.2f} tests whether the current run is either decaying too early or too late."
-                ),
-                intervention={"warmdown_ratio": new_warmdown},
-                expected_effect={
-                    "val_bpb_direction": "down",
-                    "val_bpb_delta": "0.00 to -0.05",
-                    "num_steps_direction": "flat",
-                    "peak_vram_mb_direction": "flat",
-                },
-                success_criteria="Improve val_bpb without changing step count, supporting a pure optimization explanation.",
-                alternative_explanations=[
-                    "Any gain may reflect better compatibility with the current matrix LR rather than a generally better schedule.",
-                    "A null result may mean architecture dominates schedule at this scale.",
-                ],
-                follow_if_supported=[
-                    "Jointly tune the schedule with matrix LR.",
-                ],
-                follow_if_not_supported=[
-                    "De-prioritize schedule-only experiments for now.",
-                ],
-                confidence="low",
-                scientific_value="Useful disambiguation of optimization vs throughput mechanisms.",
-                family="optimization",
-                score=0.58,
-            )
-        )
 
-    return sorted(hypotheses, key=lambda item: item.score, reverse=True)
+def ensure_registry() -> ToolRegistry:
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    PUBLISHED_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    registry = ToolRegistry.load(TOOLS_REGISTRY_PATH, PUBLISHED_TOOLS_DIR)
+    registry.save(TOOLS_REGISTRY_PATH)
+    return registry
 
 
 def iter_run_dirs() -> list[Path]:
@@ -427,7 +460,7 @@ def read_live_workers() -> list[WorkerStatus]:
             heartbeat_age = max(0.0, (now - updated_at).total_seconds())
         worker = WorkerStatus(
             worker_id=payload["worker_id"],
-            node_id=payload["node_id"],
+            node_id=payload.get("node_id", ""),
             gpu_id=str(payload["gpu_id"]),
             run_id=payload.get("run_id"),
             state=payload["state"],
@@ -512,9 +545,10 @@ def collect_experiments() -> list[AggregateExperiment]:
         events = read_jsonl(run_dir / "events.jsonl")
         latest_event = events[-1] if events else None
 
+        plan_hypothesis = plan.get("hypothesis", {})
         title = (
             result.get("title")
-            or plan.get("hypothesis", {}).get("title")
+            or plan_hypothesis.get("title")
             or config.get("notes")
             or experiment_id
         )
@@ -565,28 +599,36 @@ def collect_experiments() -> list[AggregateExperiment]:
     return experiments
 
 
-def experiments_to_results_rows(experiments: list[AggregateExperiment]) -> list[dict[str, Any]]:
-    rows = []
+def experiments_to_results_rows(experiments: list[AggregateExperiment]) -> list[ResultRow]:
+    rows: list[ResultRow] = []
     for item in experiments:
         if item.status not in {"keep", "discard", "crash", "replicate"}:
             continue
         metrics = item.metrics or {}
         peak_vram_mb = float(metrics.get("peak_vram_mb", 0.0) or 0.0)
         rows.append(
-            {
-                "experiment_id": item.experiment_id,
-                "commit": item.commit or "unknown",
-                "val_bpb": float(metrics.get("val_bpb", 0.0) or 0.0),
-                "memory_gb": peak_vram_mb / 1024.0,
-                "status": item.status,
-                "description": item.title,
-            }
+            ResultRow(
+                commit=item.commit or "unknown",
+                val_bpb=float(metrics.get("val_bpb", 0.0) or 0.0),
+                memory_gb=peak_vram_mb / 1024.0,
+                status=item.status,
+                description=item.title,
+            )
         )
-    rows.sort(key=lambda row: row["experiment_id"])
     return rows
 
 
-def render_progress(rows: list[dict[str, Any]], output_path: Path) -> None:
+def effective_result_rows(experiments: list[AggregateExperiment]) -> list[ResultRow]:
+    rows = read_results_tsv(RESULTS_TSV_PATH)
+    if rows:
+        return rows
+    rows = experiments_to_results_rows(experiments)
+    if rows:
+        write_results_tsv(rows)
+    return rows
+
+
+def render_progress(rows: list[ResultRow], output_path: Path) -> None:
     if not rows:
         return
     try:
@@ -595,9 +637,9 @@ def render_progress(rows: list[dict[str, Any]], output_path: Path) -> None:
         return
 
     xs = list(range(len(rows)))
-    val_bpb = [row["val_bpb"] for row in rows]
-    statuses = [row["status"] for row in rows]
-    descriptions = [row["description"] for row in rows]
+    val_bpb = [row.val_bpb for row in rows]
+    statuses = [row.status for row in rows]
+    descriptions = [row.description for row in rows]
 
     fig, ax = plt.subplots(figsize=(16, 8))
     discard_x = [x for x, status in zip(xs, statuses) if status != "keep"]
@@ -630,25 +672,23 @@ def render_progress(rows: list[dict[str, Any]], output_path: Path) -> None:
     plt.close(fig)
 
 
-def build_leaderboard(experiments: list[AggregateExperiment], workers: list[WorkerStatus]) -> dict[str, Any]:
+def build_leaderboard(
+    experiments: list[AggregateExperiment], workers: list[WorkerStatus], rows: list[ResultRow]
+) -> dict[str, Any]:
     decided = [item for item in experiments if item.status in {"keep", "discard", "crash", "replicate"}]
-    kept = [item for item in experiments if item.status == "keep"]
-    best = None
-    if kept:
-        best = min(kept, key=lambda item: float(item.metrics.get("val_bpb", math.inf)))
+    best_row = best_result(rows)
+    kept = [row for row in rows if row.status == "keep"]
     return {
         "generated_at": utc_now_iso(),
         "total_runs": len(experiments),
         "decided_runs": len(decided),
         "active_workers": sum(1 for worker in workers if is_worker_active(worker)),
-        "best_run": None if best is None else best.to_dict(),
-        "keep_rate": round(len(kept) / len(decided), 3) if decided else 0.0,
+        "best_run": None if best_row is None else asdict(best_row),
+        "keep_rate": round(len(kept) / len(rows), 3) if rows else 0.0,
     }
 
 
-def best_kept_experiment(
-    experiments: list[AggregateExperiment],
-) -> AggregateExperiment | None:
+def best_kept_experiment(experiments: list[AggregateExperiment]) -> AggregateExperiment | None:
     kept = [item for item in experiments if item.status == "keep"]
     if not kept:
         return None
@@ -695,13 +735,20 @@ def recent_peer_outcomes(
     return decided[:limit]
 
 
+def hypotheses_for_worker(brief: ResearchBrief, worker_id: str) -> list[Hypothesis]:
+    return [
+        item
+        for item in brief.hypothesis_queue
+        if item.assigned_worker == worker_id and item.status == "dispatched"
+    ]
+
+
 def render_fleet_brief(
     experiments: list[AggregateExperiment],
     workers: list[WorkerStatus],
-    hypotheses: list[Hypothesis],
+    brief: ResearchBrief,
+    registry: ToolRegistry,
 ) -> str:
-    kept = [item for item in experiments if item.status == "keep"]
-    kept.sort(key=lambda item: item.created_at)
     best = best_kept_experiment(experiments)
     recent = sorted(
         [item for item in experiments if item.status in {"keep", "discard", "crash", "replicate"}],
@@ -709,6 +756,10 @@ def render_fleet_brief(
         reverse=True,
     )[:8]
     active_workers = [worker for worker in workers if is_worker_active(worker)]
+    next_hypotheses = [
+        item for item in brief.hypothesis_queue if item.status in {"pending", "dispatched"}
+    ][:6]
+    tool_requests = [tool for tool in registry.tools if tool.status == "requested"][:6]
 
     lines = [
         "# Fleet Brief",
@@ -718,18 +769,36 @@ def render_fleet_brief(
         "## Best Known Result",
     ]
     if best is None:
-        lines.append("- No kept runs yet.")
+        best_row = best_result(effective_result_rows(experiments))
+        if best_row is None:
+            lines.append("- No kept runs yet.")
+        else:
+            lines.append(
+                f"- `{best_row.commit}` {best_row.description}: val_bpb={best_row.val_bpb:.6f}"
+            )
     else:
         lines.append(
             f"- `{best.experiment_id}` {best.title}: val_bpb={float(best.metrics.get('val_bpb', math.inf)):.6f}, "
             f"worker={best.worker_id}, gpu={best.gpu_id}"
         )
+
+    lines.extend(["", "## Next Hypotheses"])
+    if not next_hypotheses:
+        lines.append("- No pending hypotheses. Observer should refresh `research_brief.json`.")
+    else:
+        for hypothesis in next_hypotheses:
+            assignment = hypothesis.assigned_worker or "unassigned"
+            lines.append(
+                f"- `{hypothesis.hypothesis_id}` [{hypothesis.status}] {hypothesis.title} -> {assignment}"
+            )
+
     lines.extend(["", "## Active Workers"])
     if not active_workers:
         lines.append("- No active workers.")
     else:
         for worker in active_workers:
             lines.append(describe_worker(worker))
+
     lines.extend(["", "## Recent Decided Runs"])
     if not recent:
         lines.append("- No decided runs yet.")
@@ -738,136 +807,351 @@ def render_fleet_brief(
             val_bpb = item.metrics.get("val_bpb")
             val_text = "n/a" if val_bpb is None else f"{float(val_bpb):.6f}"
             lines.append(f"- `{item.experiment_id}` [{item.status}] {item.title} -> {val_text}")
-    lines.extend(["", "## Next Hypotheses"])
-    if not hypotheses:
-        lines.append("- No hypotheses available.")
+
+    lines.extend(["", "## Tool Requests"])
+    if not tool_requests:
+        lines.append("- No requested tools.")
     else:
-        for hypothesis in hypotheses[:5]:
-            lines.append(f"- `{hypothesis.hypothesis_id}` {hypothesis.title}")
+        for tool in tool_requests:
+            lines.append(f"- `{tool.tool_id}` {tool.title}: {tool.problem}")
     return "\n".join(lines) + "\n"
 
 
-def render_main_agent_prompt(manifest: FleetManifest) -> str:
+def render_observer_protocol(manifest: FleetManifest) -> str:
     worker_list = "\n".join(
         f"- `{worker.worker_id}` gpu={worker.gpu_id} worktree=`{worker.worktree_path}` branch=`{worker.branch}`"
         for worker in manifest.workers
     )
-    remote = get_origin_remote()
     return (
-        "# Main Agent Protocol\n\n"
-        "You are the meta-orchestrator for a multi-GPU autoresearch fleet.\n\n"
-        "Repository identity:\n"
-        f"- Root repo: `{ROOT}`\n"
-        f"- Git remote: `{remote}`\n"
-        "- Default mode: use git worktrees for parallel worker edits, not one shared branch.\n\n"
-        "Responsibilities:\n"
-        "- Read the shared research state before making decisions.\n"
-        "- Monitor every worker's live status and recent run events.\n"
-        "- Update the scientific interpretation after each run.\n"
-        "- Choose the next hypotheses so workers learn from each other's wins, losses, and crashes.\n"
-        "- Do not edit worker worktrees directly unless you explicitly intend to take over that worker.\n\n"
-        "Read first:\n"
-        f"- `{FLEET_BRIEF_PATH}`\n"
-        f"- `{LIVE_SUMMARY_PATH}`\n"
-        f"- `{EXPERIMENTS_PATH}`\n"
-        f"- `{KNOWLEDGE_PATH}`\n\n"
-        "Workers:\n"
-        f"{worker_list}\n\n"
-        "Loop:\n"
-        "1. Keep `uv run python orchestrator.py monitor --interval 5` running in the repo root.\n"
-        "2. Inspect `status` and recent experiments.\n"
-        "3. Ensure each worker agent stays inside its assigned git worktree and branch.\n"
-        "4. For each completed run, decide keep/discard/crash/replicate and record it.\n"
-        "5. Regenerate worker briefs by running `sync` again.\n"
-        "6. Dispatch new work to any free GPU worker.\n"
-    )
-
-
-def render_worker_prompt(manifest: FleetManifest, worker: FleetWorker) -> str:
-    remote = get_origin_remote()
-    return (
-        f"# Worker Agent Protocol: {worker.worker_id}\n\n"
-        f"You own GPU `{worker.gpu_id}` and git worktree `{worker.worktree_path}` on branch `{worker.branch}`.\n\n"
-        "Repository identity:\n"
-        f"- Root repo remote: `{remote}`\n"
-        f"- Assigned worktree: `{worker.worktree_path}`\n"
-        "- Default mode: edit and commit inside your assigned git worktree. Do not treat the root repo as your coding checkout.\n\n"
-        "Responsibilities:\n"
-        "- Edit only your worktree's `train.py`.\n"
-        "- Before each new experiment, read shared fleet state so you learn from peer runs.\n"
-        "- Monitor peer workers through the shared live summary and aggregate experiment index.\n"
-        "- Run one experiment at a time on your assigned GPU.\n"
-        "- Record outcomes back into the shared science log.\n\n"
-        "Read first on every loop:\n"
-        f"- `{FLEET_BRIEF_PATH}`\n"
-        f"- `{LIVE_SUMMARY_PATH}`\n"
-        f"- `{EXPERIMENTS_PATH}`\n"
-        f"- `{worker.prompt_path}`\n\n"
+        "# Observer Protocol\n\n"
+        "You are the observer. You control experiment dispatch for the fleet.\n\n"
         "Rules:\n"
-        "- Stay inside your worktree when editing code.\n"
-        f"- Commit experimental code on branch `{worker.branch}` so the worktree history matches the run history.\n"
-        f"- Use the shared root research directory `{RESEARCH_DIR}` as the source of truth.\n"
-        "- If another worker just found a strong result in the same hypothesis family, pivot rather than duplicating it.\n"
-        "- If a peer crash reveals a broken idea, avoid repeating it unless you are deliberately testing a fix.\n"
+        "- Do not edit worker worktrees directly unless you are explicitly taking ownership of that worker.\n"
+        "- Choose the experiment queue. Workers do not self-dispatch in fleet mode.\n"
+        "- Persist dispatch state in `research/research_brief.json` by editing `hypothesis_queue`.\n"
+        "- A dispatched hypothesis must set `status` to `dispatched` and `assigned_worker` to a worker id.\n"
+        "- You own the fleet-level decision after each run: keep, discard, crash, replicate, and whether the branch should advance.\n"
+        "- Workers may report metrics and suggested interpretation, but the observer makes the final decision of record.\n"
+        "- After changing the queue, run `uv run python orchestrator.py sync` so worker assignments regenerate.\n"
+        "- Keep `research/search_model.md` current. That file is your scratchpad and theory ledger.\n"
+        "- Use the tool-builder only when the fleet needs a reusable script or analysis helper.\n\n"
+        "Read on every cycle:\n"
+        f"- `{FLEET_BRIEF_PATH}`\n"
+        f"- `{LIVE_SUMMARY_PATH}`\n"
+        f"- `{BRIEF_PATH}`\n"
+        f"- `{KNOWLEDGE_PATH}`\n"
+        f"- `{SEARCH_MODEL_PATH}`\n"
+        f"- `{TOOLS_REGISTRY_PATH}`\n\n"
+        "Workers:\n"
+        f"{worker_list}\n"
     )
 
 
-def update_worker_prompts(manifest: FleetManifest, experiments: list[AggregateExperiment], workers: list[WorkerStatus], hypotheses: list[Hypothesis]) -> None:
-    write_text(FLEET_BRIEF_PATH, render_fleet_brief(experiments, workers, hypotheses))
-    write_text(Path(manifest.main_prompt_path), render_main_agent_prompt(manifest))
-    best = best_kept_experiment(experiments)
-    for worker in manifest.workers:
-        peer_workers = [item for item in workers if item.worker_id != worker.worker_id]
-        peer_outcomes = recent_peer_outcomes(experiments, worker.worker_id)
-        assignment_lines = [
-            f"# Assignment Brief: {worker.worker_id}",
-            "",
-            f"Worktree: `{worker.worktree_path}`",
-            f"Branch: `{worker.branch}`",
-            f"GPU: `{worker.gpu_id}`",
+def render_tool_builder_protocol() -> str:
+    return (
+        "# Tool-Builder Protocol\n\n"
+        "You are the tool-builder. Build small reusable helper scripts when the observer or workers request them.\n\n"
+        "Rules:\n"
+        "- Only create tools that solve a concrete recurring problem.\n"
+        "- Prefer zero-dependency Python or shell utilities that run inside this repo.\n"
+        "- Publish tools under `research/tools/published/`.\n"
+        "- Update `research/tools/registry.json` by changing requested tools to `published` and filling `path`, `summary`, and `usage`.\n"
+        "- Treat a valid request as an entry with `tool_id`, `title`, `problem`, `requested_by`, and `status: requested`.\n"
+        "- After publishing, set `path` to the tool file, add a one-line `summary`, and provide at least one concrete `usage` command.\n"
+        "- Do not rewrite worker code or dispatch experiments. Your scope is tooling only.\n"
+    )
+
+
+def render_gpu_worker_protocol() -> str:
+    return (
+        "# GPU Worker Protocol\n\n"
+        "You are a GPU worker. Execute the observer's assigned hypothesis on your dedicated GPU.\n\n"
+        "Rules:\n"
+        "- Stay inside your assigned git worktree when editing code.\n"
+        "- Edit only `train.py` in your worktree unless the assignment explicitly says otherwise.\n"
+        "- Do not self-dispatch new experiments. If the assignment is empty, wait and monitor shared state.\n"
+        "- Run exactly one experiment at a time on your assigned GPU.\n"
+        "- Use `CUDA_VISIBLE_DEVICES=<gpu> uv run train.py > run.log 2>&1` so your run stays isolated.\n"
+        "- Your default job is execution and reporting, not fleet-level decision making.\n"
+        "- Capture metrics, logs, and run artifacts under `research/runs/` when applicable.\n"
+        "- Only write `results.tsv` or make the final keep/discard/crash decision if the assignment explicitly asks you to do so.\n"
+        "- Read shared state before every run so you avoid duplicating peer work.\n"
+    )
+
+
+def render_observer_start() -> str:
+    return (
+        "# Observer Start Here\n\n"
+        "Role: `observer`\n\n"
+        "Read exactly in this order:\n"
+        f"1. `{OBSERVER_ASSIGNMENT_PATH}`\n"
+        f"2. `{OBSERVER_PROTOCOL_PATH}`\n"
+        f"3. `{SEARCH_MODEL_PATH}`\n"
+    )
+
+
+def render_tool_builder_start() -> str:
+    return (
+        "# Tool-Builder Start Here\n\n"
+        "Role: `tool-builder`\n\n"
+        "Read exactly in this order:\n"
+        f"1. `{TOOL_BUILDER_ASSIGNMENT_PATH}`\n"
+        f"2. `{TOOL_BUILDER_PROTOCOL_PATH}`\n"
+        f"3. `{TOOLS_REGISTRY_PATH}`\n"
+    )
+
+
+def render_worker_start(worker: FleetWorker) -> str:
+    assignment_path = WORKER_ASSIGNMENTS_DIR / f"{worker.worker_id}.md"
+    return (
+        f"# GPU-Worker Start Here: {worker.worker_id}\n\n"
+        "Role: `gpu-worker`\n"
+        f"Agent: `{worker.worker_id}`\n\n"
+        "Paths:\n"
+        f"- `ROOT` = `{ROOT}`\n"
+        f"- `WORKTREE` = `{worker.worktree_path}`\n"
+        f"- `RESEARCH` = `{RESEARCH_DIR}`\n"
+        f"- `TOOLS` = `{PUBLISHED_TOOLS_DIR}`\n"
+        f"- `SEARCH_MODEL` = `{SEARCH_MODEL_PATH}`\n\n"
+        "Read exactly in this order:\n"
+        f"1. `{assignment_path}`\n"
+        f"2. `{GPU_WORKER_PROTOCOL_PATH}`\n"
+        f"3. `{SEARCH_MODEL_PATH}`\n"
+    )
+
+
+def render_legacy_main_prompt() -> str:
+    return (
+        "# Main Agent Alias\n\n"
+        "The fleet now uses an observer-centered N+2 topology.\n"
+        f"Use `{OBSERVER_PROMPT_PATH}` as the root orchestration prompt.\n"
+    )
+
+
+def render_observer_assignment(
+    manifest: FleetManifest,
+    workers: list[WorkerStatus],
+    brief: ResearchBrief,
+    registry: ToolRegistry,
+) -> str:
+    free_workers = [worker for worker in workers if not is_worker_active(worker)]
+    pending = [item for item in brief.hypothesis_queue if item.status == "pending"]
+    dispatched = [item for item in brief.hypothesis_queue if item.status == "dispatched"]
+    requested_tools = [tool for tool in registry.tools if tool.status == "requested"]
+
+    lines = [
+        "# Observer Assignment",
+        "",
+        f"Repository: `{ROOT}`",
+        f"Research dir: `{RESEARCH_DIR}`",
+        f"Git remote: `{get_origin_remote()}`",
+        "",
+        "## Fleet",
+    ]
+    if not workers:
+        lines.append("- No workers configured.")
+    else:
+        lines.extend(describe_worker(worker) for worker in workers)
+
+    lines.extend(["", "## Dispatch Contract"])
+    lines.extend(
+        [
+            "- Edit `research/research_brief.json` directly when you dispatch.",
+            "- Use one `hypothesis_queue` entry per experiment idea.",
+            "- Set `status` to `dispatched` and `assigned_worker` to the target worker id.",
+            "- After edits, run `uv run python orchestrator.py sync` to regenerate assignments.",
+            "- When a run is finished, mark the hypothesis `completed` or `abandoned`, add a short `outcome`, and decide keep/discard/crash/replicate for the fleet record.",
+            "- If you need a reusable helper, add a tool request in `research/tools/registry.json` with: `tool_id`, `title`, `problem`, `requested_by`, and `status: requested`.",
         ]
-        if worker.current_run_id:
-            assignment_lines.append(f"Current run: `{worker.current_run_id}`")
-        if worker.current_hypothesis_id:
-            assignment_lines.append(f"Current hypothesis: `{worker.current_hypothesis_id}`")
-        if worker.current_title:
-            assignment_lines.append(f"Current title: {worker.current_title}")
-        assignment_lines.extend(["", "Shared scientific state:"])
-        if best is None:
-            assignment_lines.append("- No kept result yet.")
-        else:
-            assignment_lines.append(
-                f"- Best keep is `{best.experiment_id}` ({best.title}) with val_bpb={float(best.metrics.get('val_bpb', math.inf)):.6f}."
+    )
+
+    lines.extend(["", "## Free Workers"])
+    if not free_workers:
+        lines.append("- No idle workers.")
+    else:
+        for worker in free_workers:
+            lines.append(f"- `{worker.worker_id}` gpu={worker.gpu_id}")
+
+    lines.extend(["", "## Pending Hypotheses"])
+    if not pending:
+        lines.append("- No pending hypotheses.")
+    else:
+        for item in pending:
+            lines.append(f"- `{item.hypothesis_id}` {item.title}: {item.rationale}")
+
+    lines.extend(["", "## Dispatched Hypotheses"])
+    if not dispatched:
+        lines.append("- No dispatched hypotheses.")
+    else:
+        for item in dispatched:
+            lines.append(
+                f"- `{item.hypothesis_id}` -> `{item.assigned_worker or 'unassigned'}`: {item.title}"
             )
-        assignment_lines.extend(["", "Peer workers:"])
-        if not peer_workers:
-            assignment_lines.append("- No peer worker status available.")
-        else:
-            assignment_lines.extend(describe_worker(item) for item in peer_workers)
-        assignment_lines.extend(["", "Recent peer outcomes:"])
-        if not peer_outcomes:
-            assignment_lines.append("- No peer outcomes recorded yet.")
-        else:
-            for item in peer_outcomes:
-                val_bpb = item.metrics.get("val_bpb")
-                val_text = "n/a" if val_bpb is None else f"{float(val_bpb):.6f}"
-                assignment_lines.append(
-                    f"- `{item.experiment_id}` [{item.status}] {item.title} val_bpb={val_text}"
-                )
-        assignment_lines.extend(
-            [
-                "",
-                "Shared protocol:",
-                f"- Read `{FLEET_BRIEF_PATH}` before choosing your next edit.",
-                f"- Monitor `{LIVE_WORKERS_DIR}/*.json` for peer progress.",
-                f"- Keep `uv run python {ROOT / 'orchestrator.py'} status` or `uv run python {ROOT / 'orchestrator.py'} monitor --interval 5` nearby while peers are training.",
-                f"- Treat `{RESEARCH_DIR}` as shared memory across all workers.",
-                "",
-                render_worker_prompt(manifest, worker).rstrip(),
-                "",
-            ]
+
+    lines.extend(["", "## Tool Requests"])
+    if not requested_tools:
+        lines.append("- No tool requests.")
+    else:
+        for tool in requested_tools:
+            lines.append(f"- `{tool.tool_id}` {tool.title}: {tool.problem}")
+
+    lines.extend(["", "## Worker Inventory"])
+    for worker in manifest.workers:
+        lines.append(
+            f"- `{worker.worker_id}` branch=`{worker.branch}` worktree=`{worker.worktree_path}`"
         )
-        write_text(Path(worker.prompt_path), "\n".join(assignment_lines))
+
+    return "\n".join(lines) + "\n"
+
+
+def render_tool_builder_assignment(registry: ToolRegistry) -> str:
+    requested_tools = [tool for tool in registry.tools if tool.status == "requested"]
+    published_tools = [tool for tool in registry.tools if tool.status == "published"][:8]
+    lines = [
+        "# Tool-Builder Assignment",
+        "",
+        f"Registry: `{TOOLS_REGISTRY_PATH}`",
+        f"Published dir: `{PUBLISHED_TOOLS_DIR}`",
+        "",
+        "## Request Contract",
+        "- Expect requested entries to include: `tool_id`, `title`, `problem`, `requested_by`, `status: requested`.",
+        "- On publish, fill `path`, `summary`, and `usage`, then change `status` to `published`.",
+        "",
+        "## Requested Tools",
+    ]
+    if not requested_tools:
+        lines.append("- No requested tools. Stand by.")
+    else:
+        for tool in requested_tools:
+            lines.append(
+                f"- `{tool.tool_id}` {tool.title}: {tool.problem} (requested by {tool.requested_by or 'unknown'})"
+            )
+
+    lines.extend(["", "## Recently Published"])
+    if not published_tools:
+        lines.append("- No published tools yet.")
+    else:
+        for tool in published_tools:
+            lines.append(f"- `{tool.tool_id}` {tool.title}: {tool.path or 'path unset'}")
+    return "\n".join(lines) + "\n"
+
+
+def render_worker_assignment(
+    worker: FleetWorker,
+    workers: list[WorkerStatus],
+    experiments: list[AggregateExperiment],
+    brief: ResearchBrief,
+) -> str:
+    peer_workers = [item for item in workers if item.worker_id != worker.worker_id]
+    peer_outcomes = recent_peer_outcomes(experiments, worker.worker_id)
+    assigned = hypotheses_for_worker(brief, worker.worker_id)
+
+    lines = [
+        f"# Worker Assignment: {worker.worker_id}",
+        "",
+        f"Worktree: `{worker.worktree_path}`",
+        f"Branch: `{worker.branch}`",
+        f"GPU: `{worker.gpu_id}`",
+        "",
+        "## Assignment Source",
+        "- Observer dispatch is sourced from `research/research_brief.json`.",
+        "- If this file says `Await observer dispatch`, do not invent a new experiment.",
+        "- The observer owns the final keep/discard/crash decision unless this assignment explicitly says otherwise.",
+        "",
+        "## Current Assignment",
+    ]
+    if not assigned:
+        lines.append("- Await observer dispatch.")
+    else:
+        for item in assigned:
+            lines.append(f"- Hypothesis: `{item.hypothesis_id}`")
+            lines.append(f"- Title: {item.title}")
+            lines.append(f"- Rationale: {item.rationale}")
+            lines.append(f"- Config overrides: `{json.dumps(item.config_overrides, sort_keys=True)}`")
+            lines.append(
+                f"- Run command: `CUDA_VISIBLE_DEVICES={worker.gpu_id} uv run train.py > run.log 2>&1`"
+            )
+            lines.append("- After the run: report metrics, logs, and your interpretation back to shared state; do not self-dispatch a follow-up family.")
+            if item.outcome:
+                lines.append(f"- Prior outcome note: {item.outcome}")
+
+    lines.extend(["", "## Peer Workers"])
+    if not peer_workers:
+        lines.append("- No peer worker status available.")
+    else:
+        lines.extend(describe_worker(item) for item in peer_workers)
+
+    lines.extend(["", "## Recent Peer Outcomes"])
+    if not peer_outcomes:
+        lines.append("- No peer outcomes recorded yet.")
+    else:
+        for item in peer_outcomes:
+            val_bpb = item.metrics.get("val_bpb")
+            val_text = "n/a" if val_bpb is None else f"{float(val_bpb):.6f}"
+            lines.append(f"- `{item.experiment_id}` [{item.status}] {item.title} val_bpb={val_text}")
+
+    return "\n".join(lines) + "\n"
+
+
+def refresh_manifest_state(
+    manifest: FleetManifest,
+    live_workers: list[WorkerStatus],
+    brief: ResearchBrief,
+) -> None:
+    live_by_worker = {worker.worker_id: worker for worker in live_workers}
+    for manifest_worker in manifest.workers:
+        live_worker = live_by_worker.get(manifest_worker.worker_id)
+        dispatched = hypotheses_for_worker(brief, manifest_worker.worker_id)
+        if live_worker is not None and is_worker_active(live_worker):
+            manifest_worker.current_run_id = live_worker.run_id
+            manifest_worker.current_hypothesis_id = live_worker.hypothesis_id
+            manifest_worker.current_title = live_worker.title
+        elif dispatched:
+            manifest_worker.current_run_id = None
+            manifest_worker.current_hypothesis_id = dispatched[0].hypothesis_id
+            manifest_worker.current_title = dispatched[0].title
+        else:
+            manifest_worker.current_run_id = None
+            manifest_worker.current_hypothesis_id = None
+            manifest_worker.current_title = None
+
+
+def write_fleet_docs(
+    manifest: FleetManifest,
+    experiments: list[AggregateExperiment],
+    workers: list[WorkerStatus],
+    brief: ResearchBrief,
+    registry: ToolRegistry,
+) -> None:
+    active_worker_ids = {worker.worker_id for worker in manifest.workers}
+    for stale_path in WORKER_PROMPTS_DIR.glob("*.md"):
+        if stale_path.stem not in active_worker_ids:
+            stale_path.unlink(missing_ok=True)
+    for stale_path in WORKER_ASSIGNMENTS_DIR.glob("*.md"):
+        if stale_path.stem not in active_worker_ids:
+            stale_path.unlink(missing_ok=True)
+
+    write_text(FLEET_BRIEF_PATH, render_fleet_brief(experiments, workers, brief, registry))
+    write_text(Path(manifest.observer_prompt_path), render_observer_start())
+    write_text(Path(manifest.tool_builder_prompt_path), render_tool_builder_start())
+    if manifest.main_prompt_path:
+        write_text(Path(manifest.main_prompt_path), render_legacy_main_prompt())
+    write_text(OBSERVER_PROTOCOL_PATH, render_observer_protocol(manifest))
+    write_text(TOOL_BUILDER_PROTOCOL_PATH, render_tool_builder_protocol())
+    write_text(GPU_WORKER_PROTOCOL_PATH, render_gpu_worker_protocol())
+    write_text(
+        OBSERVER_ASSIGNMENT_PATH,
+        render_observer_assignment(manifest, workers, brief, registry),
+    )
+    write_text(TOOL_BUILDER_ASSIGNMENT_PATH, render_tool_builder_assignment(registry))
+
+    for worker in manifest.workers:
+        assignment_path = WORKER_ASSIGNMENTS_DIR / f"{worker.worker_id}.md"
+        write_text(
+            assignment_path,
+            render_worker_assignment(worker, workers, experiments, brief),
+        )
+        write_text(Path(worker.prompt_path), render_worker_start(worker))
 
 
 def sync_artifacts() -> dict[str, Any]:
@@ -875,18 +1159,24 @@ def sync_artifacts() -> dict[str, Any]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     LIVE_WORKERS_DIR.mkdir(parents=True, exist_ok=True)
     AGGREGATE_DIR.mkdir(parents=True, exist_ok=True)
+    FLEET_PROTOCOLS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKER_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKER_ASSIGNMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    ensure_search_model()
+    registry = ensure_registry()
 
     manifest = load_fleet_manifest()
     experiments = collect_experiments()
     live_workers = read_live_workers()
     workers = materialize_fleet_workers(manifest, live_workers)
-    hypotheses = hypothesis_templates(ExperimentConfig(), read_results_tsv(RESULTS_TSV_PATH))
-    write_json(EXPERIMENTS_PATH, {"experiments": [item.to_dict() for item in experiments]})
-    write_json(LEADERBOARD_PATH, build_leaderboard(experiments, workers))
+    rows = effective_result_rows(experiments)
+    brief = build_research_brief(rows)
+    brief.save(BRIEF_PATH)
 
-    result_rows = experiments_to_results_rows(experiments)
-    write_results_tsv(result_rows)
-    render_progress(result_rows, PROGRESS_PNG_PATH)
+    write_json(EXPERIMENTS_PATH, {"experiments": [item.to_dict() for item in experiments]})
+    write_json(LEADERBOARD_PATH, build_leaderboard(experiments, workers, rows))
+    render_progress(rows, PROGRESS_PNG_PATH)
 
     summary = {
         "generated_at": utc_now_iso(),
@@ -898,292 +1188,21 @@ def sync_artifacts() -> dict[str, Any]:
             "results_tsv": str(RESULTS_TSV_PATH),
             "progress_png": str(PROGRESS_PNG_PATH),
             "aggregate_experiments": str(EXPERIMENTS_PATH),
+            "research_brief": str(BRIEF_PATH),
+            "observer_prompt": str(OBSERVER_PROMPT_PATH),
+            "tool_builder_prompt": str(TOOL_BUILDER_PROMPT_PATH),
         },
     }
-    tsv_rows = read_results_tsv(RESULTS_TSV_PATH)
-    best = best_result(tsv_rows)
+    best = best_result(rows)
     if best is not None:
         summary["best_result"] = asdict(best)
     write_json(LIVE_SUMMARY_PATH, summary)
+
     if manifest is not None:
-        live_by_worker = {worker.worker_id: worker for worker in live_workers}
-        for manifest_worker in manifest.workers:
-            live_worker = live_by_worker.get(manifest_worker.worker_id)
-            if live_worker is not None and is_worker_active(live_worker):
-                manifest_worker.current_run_id = live_worker.run_id
-                manifest_worker.current_hypothesis_id = live_worker.hypothesis_id
-                manifest_worker.current_title = live_worker.title
-            else:
-                manifest_worker.current_run_id = None
-                manifest_worker.current_hypothesis_id = None
-                manifest_worker.current_title = None
+        refresh_manifest_state(manifest, live_workers, brief)
         save_fleet_manifest(manifest)
-        update_worker_prompts(manifest, experiments, workers, hypotheses)
+        write_fleet_docs(manifest, experiments, workers, brief, registry)
     return summary
-
-
-def build_research_brief() -> ResearchBrief:
-    sync_artifacts()
-    config = ExperimentConfig()
-    rows = read_results_tsv(RESULTS_TSV_PATH)
-    best = best_result(rows)
-    best_payload = asdict(best) if best is not None else {}
-    findings = summarize_findings(rows)
-    hypotheses = hypothesis_templates(config, rows)
-    constraints = [
-        "Only `train.py` is editable during public autoresearch runs; `prepare.py` stays fixed.",
-        "Primary metric is val_bpb from `evaluate_bpb()` on a pinned validation shard.",
-        "Training budget is fixed at 300 seconds, so step-efficiency is part of the objective.",
-        "Experiments must satisfy total_batch_size % (device_batch_size * MAX_SEQ_LEN) == 0.",
-        "This path assumes A100/H100-class NVIDIA GPUs, one run per GPU.",
-    ]
-    notes = [
-        f"Generated on host {platform.node()} ({platform.platform()}).",
-        "Treat small single-run wins as provisional until replicated.",
-    ]
-    return ResearchBrief(
-        generated_at=utc_now_iso(),
-        repository=ROOT.name,
-        objective="Optimize autoregressive pretraining quality under a fixed NVIDIA GPU time budget.",
-        constraints=constraints,
-        current_config=config.to_dict(),
-        best_result=best_payload,
-        findings=findings,
-        open_questions=extract_open_questions(rows, config),
-        hypothesis_queue=hypotheses,
-        notes=notes,
-    )
-
-
-def apply_intervention(
-    base_config: ExperimentConfig, intervention: dict[str, Any]
-) -> ExperimentConfig:
-    payload = base_config.to_dict()
-    payload.update(intervention)
-    return ExperimentConfig.from_dict(payload)
-
-
-def next_experiment_id() -> str:
-    existing = sorted(path.stem for path in PLANS_DIR.glob("exp-*.json"))
-    index = len(existing) + 1
-    return f"exp-{index:04d}"
-
-
-def choose_hypotheses(
-    brief: ResearchBrief, count: int, excluded_ids: set[str] | None = None
-) -> list[Hypothesis]:
-    excluded_ids = excluded_ids or set()
-    chosen = []
-    for hypothesis in brief.hypothesis_queue:
-        if hypothesis.hypothesis_id in excluded_ids:
-            continue
-        chosen.append(hypothesis)
-        if len(chosen) >= count:
-            break
-    return chosen
-
-
-def build_plan_from_hypothesis(brief: ResearchBrief, chosen: Hypothesis) -> ExperimentPlan:
-    experiment_id = next_experiment_id()
-    config = apply_intervention(
-        ExperimentConfig.from_dict(brief.current_config), chosen.intervention
-    )
-    config.notes = chosen.title
-    config_path = RUNS_DIR / experiment_id / "config.json"
-    metadata_path = RUNS_DIR / experiment_id / "metadata.json"
-    config.save(config_path)
-    return ExperimentPlan(
-        experiment_id=experiment_id,
-        created_at=utc_now_iso(),
-        phase="scientific_experimentation",
-        based_on_commit=get_head_commit(),
-        hypothesis=chosen,
-        config_path=str(config_path.relative_to(ROOT)),
-        output_metadata_path=str(metadata_path.relative_to(ROOT)),
-        run_command=f"uv run train.py --config {config_path.relative_to(ROOT)} --metadata-out {metadata_path.relative_to(ROOT)}",
-        decision_rules={
-            "keep": "Keep only if val_bpb clearly improves and the result matches the intended mechanism.",
-            "replicate": "Replicate if the gain is small, surprising, or contradicts prior evidence.",
-            "discard": "Discard if val_bpb worsens or the run invalidates the hypothesis.",
-        },
-    )
-
-
-def build_plan(brief_path: Path, hypothesis_id: str | None) -> ExperimentPlan:
-    if not brief_path.exists():
-        brief = build_research_brief()
-        brief.save(brief_path)
-    else:
-        payload = json.loads(brief_path.read_text())
-        brief = ResearchBrief(
-            generated_at=payload["generated_at"],
-            repository=payload["repository"],
-            objective=payload["objective"],
-            constraints=payload["constraints"],
-            current_config=payload["current_config"],
-            best_result=payload["best_result"],
-            findings=[EmpiricalFinding(**item) for item in payload["findings"]],
-            open_questions=payload["open_questions"],
-            hypothesis_queue=[Hypothesis(**item) for item in payload["hypothesis_queue"]],
-            notes=payload.get("notes", []),
-        )
-
-    if not brief.hypothesis_queue:
-        raise ValueError("No hypotheses available to plan.")
-
-    chosen = brief.hypothesis_queue[0]
-    if hypothesis_id is not None:
-        for hypothesis in brief.hypothesis_queue:
-            if hypothesis.hypothesis_id == hypothesis_id:
-                chosen = hypothesis
-                break
-        else:
-            raise ValueError(f"Unknown hypothesis_id: {hypothesis_id}")
-    return build_plan_from_hypothesis(brief, chosen)
-
-
-def compare_prediction(
-    plan: ExperimentPlan, metrics: dict[str, Any], best_known: float | None
-) -> str:
-    direction = plan.hypothesis.expected_effect.get("val_bpb_direction")
-    actual = float(metrics.get("val_bpb", math.inf))
-    if direction == "down":
-        if best_known is not None and actual < best_known:
-            return "supported"
-        return "not_supported"
-    if direction == "mixed":
-        return "inconclusive"
-    return "unknown"
-
-
-def record_result(
-    plan_path: Path, metadata_path: Path, analysis: str, status: str
-) -> ExperimentResult:
-    plan_payload = json.loads(plan_path.read_text())
-    plan = ExperimentPlan(
-        experiment_id=plan_payload["experiment_id"],
-        created_at=plan_payload["created_at"],
-        phase=plan_payload["phase"],
-        based_on_commit=plan_payload["based_on_commit"],
-        hypothesis=Hypothesis(**plan_payload["hypothesis"]),
-        config_path=plan_payload["config_path"],
-        output_metadata_path=plan_payload["output_metadata_path"],
-        run_command=plan_payload["run_command"],
-        decision_rules=plan_payload["decision_rules"],
-    )
-    metadata = json.loads(metadata_path.read_text())
-    metrics = metadata["metrics"]
-    rows = read_results_tsv(RESULTS_TSV_PATH)
-    current_best = best_result(rows)
-    matched_prediction = compare_prediction(
-        plan, metrics, None if current_best is None else current_best.val_bpb
-    )
-    contradiction_flags = []
-    if (
-        plan.hypothesis.expected_effect.get("val_bpb_direction") == "down"
-        and status == "discard"
-    ):
-        contradiction_flags.append(
-            "Predicted improvement but observed non-improvement."
-        )
-    result = ExperimentResult(
-        experiment_id=plan.experiment_id,
-        recorded_at=utc_now_iso(),
-        status=status,
-        hypothesis_id=plan.hypothesis.hypothesis_id,
-        metrics=metrics,
-        matched_prediction=matched_prediction,
-        analysis=analysis,
-        candidate_mechanisms=plan.hypothesis.alternative_explanations,
-        next_steps=(
-            plan.hypothesis.follow_if_supported
-            if status == "keep"
-            else plan.hypothesis.follow_if_not_supported
-        ),
-        contradiction_flags=contradiction_flags,
-    )
-    knowledge = KnowledgeBase.load(KNOWLEDGE_PATH, ROOT.name)
-    knowledge.experiment_history = [
-        entry
-        for entry in knowledge.experiment_history
-        if entry.get("experiment_id") != result.experiment_id
-    ]
-    knowledge.confirmed_findings = [
-        entry
-        for entry in knowledge.confirmed_findings
-        if entry.get("experiment_id") != result.experiment_id
-    ]
-    knowledge.tentative_findings = [
-        entry
-        for entry in knowledge.tentative_findings
-        if entry.get("experiment_id") != result.experiment_id
-    ]
-    knowledge.contradictions = [
-        entry
-        for entry in knowledge.contradictions
-        if entry.get("experiment_id") != result.experiment_id
-    ]
-    history_entry = {
-        "experiment_id": result.experiment_id,
-        "hypothesis_id": result.hypothesis_id,
-        "status": result.status,
-        "matched_prediction": result.matched_prediction,
-        "metrics": result.metrics,
-        "analysis": result.analysis,
-    }
-    knowledge.experiment_history.append(history_entry)
-    target_bucket = (
-        knowledge.confirmed_findings
-        if status == "keep"
-        else knowledge.tentative_findings
-    )
-    target_bucket.append(
-        {
-            "experiment_id": result.experiment_id,
-            "hypothesis_id": plan.hypothesis.hypothesis_id,
-            "title": plan.hypothesis.title,
-            "status": status,
-            "analysis": analysis,
-            "metrics": metrics,
-        }
-    )
-    for flag in contradiction_flags:
-        knowledge.contradictions.append(
-            {
-                "experiment_id": result.experiment_id,
-                "hypothesis_id": result.hypothesis_id,
-                "flag": flag,
-                "analysis": analysis,
-            }
-        )
-    keep_count = sum(1 for entry in knowledge.experiment_history if entry["status"] == "keep")
-    total_count = len(knowledge.experiment_history)
-    knowledge.meta_research = {
-        "keep_rate": round(keep_count / total_count, 3) if total_count else 0.0,
-        "contradiction_count": len(knowledge.contradictions),
-        "total_scientific_experiments": total_count,
-    }
-    knowledge.save(KNOWLEDGE_PATH)
-
-    run_dir = RUNS_DIR / plan.experiment_id
-    append_jsonl(
-        run_dir / "events.jsonl",
-        {
-            "event_type": "decision_recorded",
-            "recorded_at": utc_now_iso(),
-            "run_id": plan.experiment_id,
-            "worker_id": metadata.get("run", {}).get("worker_id", ""),
-            "node_id": metadata.get("run", {}).get("node_id", platform.node()),
-            "gpu_id": metadata.get("run", {}).get("gpu_id", ""),
-            "payload": {
-                "status": status,
-                "title": plan.hypothesis.title,
-                "analysis": analysis,
-                "metrics": metrics,
-            },
-        },
-    )
-    return result
 
 
 def gpu_ids_from_nvidia_smi() -> list[str]:
@@ -1257,119 +1276,21 @@ def init_fleet(tag: str, gpus_arg: str | None, create_worktrees: bool) -> FleetM
         created_at=utc_now_iso(),
         repository_root=str(ROOT),
         shared_research_dir=str(RESEARCH_DIR),
-        main_prompt_path=str(MAIN_AGENT_PROMPT_PATH),
+        observer_prompt_path=str(OBSERVER_PROMPT_PATH),
+        tool_builder_prompt_path=str(TOOL_BUILDER_PROMPT_PATH),
         workers=workers,
+        main_prompt_path=str(LEGACY_MAIN_AGENT_PROMPT_PATH),
     )
     save_fleet_manifest(manifest)
     sync_artifacts()
     return manifest
 
 
-def launch_status_file(
-    worker_id: str,
-    node_id: str,
-    gpu_id: str,
-    run_id: str,
-    title: str,
-    run_dir: Path,
-    pid: int | None = None,
-    hypothesis_id: str | None = None,
-) -> None:
-    LIVE_WORKERS_DIR.mkdir(parents=True, exist_ok=True)
-    payload = WorkerStatus(
-        worker_id=worker_id,
-        node_id=node_id,
-        gpu_id=gpu_id,
-        run_id=run_id,
-        state="launching",
-        updated_at=utc_now_iso(),
-        pid=pid,
-        title=title,
-        hypothesis_id=hypothesis_id,
-        paths={
-            "run_dir": str(run_dir),
-            "live_path": str(LIVE_WORKERS_DIR / f"{worker_id}.json"),
-            "events_path": str(run_dir / "events.jsonl"),
-            "metadata_path": str(run_dir / "metadata.json"),
-            "log_path": str(run_dir / "run.log"),
-        },
-    )
-    write_json(LIVE_WORKERS_DIR / f"{worker_id}.json", payload.to_dict())
-
-
-def launch_run(
-    plan: ExperimentPlan,
-    gpu_id: str,
-    worker_id: str,
-    dry_run: bool,
-    worktree_path: Path | None = None,
-) -> list[str]:
-    run_dir = RUNS_DIR / plan.experiment_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "run.log"
-    node_id = platform.node()
-    repo_path = worktree_path or ROOT
-    if not dry_run and not repo_path.exists():
-        raise FileNotFoundError(f"Missing worker worktree at {repo_path}")
-    cmd = [
-        sys.executable,
-        str(repo_path / "train.py"),
-        "--config",
-        str(ROOT / plan.config_path),
-        "--metadata-out",
-        str(ROOT / plan.output_metadata_path),
-        "--run-id",
-        plan.experiment_id,
-        "--worker-id",
-        worker_id,
-        "--node-id",
-        node_id,
-        "--gpu-id",
-        str(gpu_id),
-        "--telemetry-dir",
-        str(run_dir),
-        "--hypothesis-id",
-        plan.hypothesis.hypothesis_id,
-    ]
-    if dry_run:
-        return cmd
-
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    launch_status_file(
-        worker_id,
-        node_id,
-        str(gpu_id),
-        plan.experiment_id,
-        plan.hypothesis.title,
-        run_dir,
-        hypothesis_id=plan.hypothesis.hypothesis_id,
-    )
-    with log_path.open("w") as handle:
-        process = subprocess.Popen(
-            cmd,
-            cwd=repo_path,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-        )
-    launch_status_file(
-        worker_id,
-        node_id,
-        str(gpu_id),
-        plan.experiment_id,
-        plan.hypothesis.title,
-        run_dir,
-        pid=process.pid,
-        hypothesis_id=plan.hypothesis.hypothesis_id,
-    )
-    return cmd
-
-
 def print_status() -> None:
     summary = sync_artifacts()
-    workers = [WorkerStatus(**payload) for payload in summary["workers"]]
+    workers = [WorkerStatus.from_dict(payload) for payload in summary["workers"]]
     manifest = load_fleet_manifest()
+    brief = load_existing_brief()
     print(f"Generated at: {summary['generated_at']}")
     if summary["best_result"] is not None:
         best = summary["best_result"]
@@ -1377,7 +1298,11 @@ def print_status() -> None:
     else:
         print("Best keep: none yet")
     if manifest is not None:
-        print(f"Fleet tag: {manifest.tag} ({len(manifest.workers)} workers)")
+        print(f"Fleet tag: {manifest.tag} ({len(manifest.workers)} workers + observer + tool-builder)")
+    if brief is not None:
+        pending = sum(1 for item in brief.hypothesis_queue if item.status == "pending")
+        dispatched = sum(1 for item in brief.hypothesis_queue if item.status == "dispatched")
+        print(f"Hypotheses: {pending} pending, {dispatched} dispatched")
     print()
     if not workers:
         print("No worker status files found.")
@@ -1395,7 +1320,7 @@ def monitor_fleet(interval_seconds: float, iterations: int | None) -> None:
     last_signature = None
     while True:
         summary = sync_artifacts()
-        workers = [WorkerStatus(**payload) for payload in summary["workers"]]
+        workers = [WorkerStatus.from_dict(payload) for payload in summary["workers"]]
         experiments = collect_experiments()
         best = summary.get("best_result")
         latest = None
@@ -1459,101 +1384,159 @@ def monitor_fleet(interval_seconds: float, iterations: int | None) -> None:
         time.sleep(interval_seconds)
 
 
-def dispatch_runs(gpus_arg: str | None, hypothesis_id: str | None, dry_run: bool) -> None:
-    sync_artifacts()
-    brief = build_research_brief()
-    brief.save(BRIEF_PATH)
-    workers = read_live_workers()
-    busy_gpu_ids = {worker.gpu_id for worker in workers if is_worker_active(worker)}
-    active_hypothesis_ids = set()
-    for worker in workers:
-        if not is_worker_active(worker) or not worker.run_id:
-            continue
-        plan_payload = load_json(PLANS_DIR / f"{worker.run_id}.json") or {}
-        hypothesis = plan_payload.get("hypothesis", {})
-        hypothesis_id_value = hypothesis.get("hypothesis_id")
-        if hypothesis_id_value:
-            active_hypothesis_ids.add(hypothesis_id_value)
-    manifest = load_fleet_manifest()
-    if manifest is not None:
-        fleet_workers = [worker for worker in manifest.workers if worker.gpu_id not in busy_gpu_ids]
-        if not fleet_workers:
-            print("No free fleet workers available.")
-            return
-    else:
-        gpu_ids = get_gpu_ids(gpus_arg)
-        free_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id not in busy_gpu_ids]
-        if not free_gpu_ids:
-            print("No free GPUs available.")
-            return
-        fleet_workers = [
-            FleetWorker(
-                worker_id=f"worker-gpu{gpu_id}",
-                gpu_id=str(gpu_id),
-                branch="",
-                worktree_path=str(ROOT),
-                prompt_path="",
-            )
-            for gpu_id in free_gpu_ids
-        ]
+def import_warm_start(source_tsv: Path) -> dict[str, Any]:
+    if not source_tsv.exists():
+        raise FileNotFoundError(f"Warm-start source not found: {source_tsv}")
 
-    if hypothesis_id is not None:
-        chosen = []
-        for item in brief.hypothesis_queue:
-            if item.hypothesis_id == hypothesis_id:
-                chosen = [item]
+    rows = read_results_tsv(source_tsv)
+    kept = [row for row in rows if row.status == "keep"]
+    if not kept:
+        raise ValueError(f"No kept results in {source_tsv}")
+
+    best = min(kept, key=lambda r: r.val_bpb)
+
+    source_dir = source_tsv.parent
+    imported_config: dict[str, Any] | None = None
+    run_root = source_dir / "research" / "runs"
+    if run_root.exists():
+        for run_dir in sorted(run_root.glob("exp-*")):
+            cfg_path = run_dir / "config.json"
+            meta_path = run_dir / "metadata.json"
+            if not cfg_path.exists():
+                continue
+            meta = load_json(meta_path) or {}
+            metrics = meta.get("metrics", {})
+            if abs(float(metrics.get("val_bpb", 0)) - best.val_bpb) < 1e-4:
+                imported_config = json.loads(cfg_path.read_text())
                 break
-        if not chosen:
-            raise ValueError(f"Unknown hypothesis_id: {hypothesis_id}")
-    else:
-        chosen = choose_hypotheses(brief, len(fleet_workers), active_hypothesis_ids)
 
-    if not chosen:
-        print("No eligible hypotheses available to dispatch.")
-        return
+    knowledge = KnowledgeBase.load(KNOWLEDGE_PATH, ROOT.name)
+    knowledge.confirmed_findings.append(
+        {
+            "source": str(source_tsv),
+            "imported_at": utc_now_iso(),
+            "best_val_bpb": best.val_bpb,
+            "best_description": best.description,
+            "best_memory_gb": best.memory_gb,
+            "total_experiments": len(rows),
+            "kept_experiments": len(kept),
+            "config": imported_config,
+        }
+    )
 
-    for worker, hypothesis in zip(fleet_workers, chosen):
-        plan = build_plan_from_hypothesis(brief, hypothesis)
-        plan_path = PLANS_DIR / f"{plan.experiment_id}.json"
-        plan.save(plan_path)
-        worker.current_run_id = plan.experiment_id
-        worker.current_hypothesis_id = hypothesis.hypothesis_id
-        worker.current_title = hypothesis.title
-        cmd = launch_run(
-            plan,
-            worker.gpu_id,
-            worker.worker_id,
-            dry_run=dry_run,
-            worktree_path=Path(worker.worktree_path) if worker.worktree_path else None,
+    descriptions = [r.description.lower() for r in kept]
+    all_descriptions = " ".join(descriptions)
+    proven: list[dict[str, Any]] = []
+    if "batch" in all_descriptions and "131072" in all_descriptions:
+        proven.append({"finding": "batch=131072 beats default 524288 at depth 9", "confidence": "high"})
+    if "depth" in all_descriptions and ("9" in all_descriptions or "10" in all_descriptions):
+        proven.append({"finding": "depth 9 substantially beats default depth 8", "confidence": "high"})
+    if "embedding_lr" in all_descriptions:
+        proven.append({"finding": "embedding_lr=0.8 beats default 0.6", "confidence": "medium"})
+    if "warmdown" in all_descriptions:
+        proven.append({"finding": "warmdown_ratio=0.85 beats default 0.5", "confidence": "medium"})
+    if "weight_decay" in all_descriptions or "weight decay" in all_descriptions:
+        proven.append({"finding": "weight_decay=0.1 beats default 0.2", "confidence": "medium"})
+    for item in proven:
+        item["source"] = str(source_tsv)
+        item["imported_at"] = utc_now_iso()
+        knowledge.tentative_findings.append(item)
+
+    knowledge.save(KNOWLEDGE_PATH)
+
+    return {
+        "source": str(source_tsv),
+        "best_val_bpb": best.val_bpb,
+        "best_description": best.description,
+        "total_imported": len(rows),
+        "kept_imported": len(kept),
+        "proven_findings": len(proven),
+        "config_recovered": imported_config is not None,
+    }
+
+
+def check_data_ready() -> bool:
+    data_dir = CACHE_DIR / "data"
+    tok_dir = CACHE_DIR / "tokenizer"
+    if not data_dir.exists() or not tok_dir.exists():
+        return False
+    shards = list(data_dir.glob("shard_*.parquet"))
+    tok_files = list(tok_dir.glob("*"))
+    return len(shards) > 0 and len(tok_files) > 0
+
+
+def bootstrap(
+    tag: str,
+    gpus_arg: str | None,
+    create_worktrees: bool,
+    warm_start_source: Path | None,
+) -> None:
+    print("=" * 60)
+    print("BOOTSTRAP: autoresearch setup")
+    print("=" * 60)
+
+    print("\n[1/4] Checking environment...")
+    gpu_ids = get_gpu_ids(gpus_arg)
+    print(f"  GPUs: {', '.join(gpu_ids)}")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        rendered = " ".join(cmd)
-        if dry_run:
-            print(f"[dry-run] {worker.worker_id}: {rendered}")
-        else:
-            print(f"Launched {plan.experiment_id} on GPU {worker.gpu_id}: {rendered}")
-    if manifest is not None:
-        save_fleet_manifest(manifest)
-        sync_artifacts()
+        print(f"  CUDA: {result.stdout.strip()}")
+    except Exception:
+        print("  CUDA: check skipped (no torch or timeout)")
+
+    print("\n[2/4] Checking data...")
+    if check_data_ready():
+        print("  Data and tokenizer already present.")
+    else:
+        print("  Running prepare.py (this may take a few minutes on first run)...")
+        prep_result = subprocess.run([sys.executable, str(ROOT / "prepare.py")], cwd=ROOT)
+        if prep_result.returncode != 0:
+            print("  ERROR: prepare.py failed. Fix this before continuing.")
+            return
+        print("  Data preparation complete.")
+
+    print("\n[3/4] Knowledge base...")
+    if warm_start_source is not None:
+        print(f"  Importing warm-start from {warm_start_source}...")
+        info = import_warm_start(warm_start_source)
+        print(f"  Imported {info['total_imported']} experiments ({info['kept_imported']} kept)")
+        print(f"  Best known: {info['best_val_bpb']:.6f} ({info['best_description']})")
+        print(f"  Proven findings seeded: {info['proven_findings']}")
+    else:
+        print("  No warm-start source. Starting fresh.")
+
+    print(f"\n[4/4] Initializing fleet (tag={tag}, gpus={','.join(gpu_ids)})...")
+    manifest = init_fleet(tag, gpus_arg, create_worktrees)
+    sync_artifacts()
+    print(f"  Fleet manifest: {FLEET_MANIFEST_PATH.relative_to(ROOT)}")
+    print(f"  Observer prompt: {Path(manifest.observer_prompt_path).relative_to(ROOT)}")
+    print(f"  Tool-builder prompt: {Path(manifest.tool_builder_prompt_path).relative_to(ROOT)}")
+    for worker in manifest.workers:
+        wt_status = "worktree ready" if Path(worker.worktree_path).exists() else "no worktree"
+        print(f"  {worker.worker_id}: gpu={worker.gpu_id} ({wt_status})")
+
+    print("\n" + "=" * 60)
+    print("SETUP COMPLETE")
+    print("=" * 60)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Scientific orchestrator for CUDA autoresearch"
-    )
+    parser = argparse.ArgumentParser(description="Scientific orchestrator for CUDA autoresearch")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("briefing", help="Generate research brief from repo state")
     subparsers.add_parser("sync", help="Rebuild aggregate artifacts from run logs")
     subparsers.add_parser("status", help="Show current live worker status")
+
     monitor_parser = subparsers.add_parser(
         "monitor", help="Continuously refresh shared state while workers are training"
     )
-    monitor_parser.add_argument(
-        "--interval",
-        type=float,
-        default=5.0,
-        help="Seconds between sync cycles",
-    )
+    monitor_parser.add_argument("--interval", type=float, default=5.0, help="Seconds between sync cycles")
     monitor_parser.add_argument(
         "--iterations",
         type=int,
@@ -1564,73 +1547,26 @@ def parse_args() -> argparse.Namespace:
     init_fleet_parser = subparsers.add_parser(
         "init-fleet", help="Create a multi-worker fleet manifest and optional git worktrees"
     )
-    init_fleet_parser.add_argument(
-        "--tag",
-        type=str,
-        required=True,
-        help="Run tag used to name worker branches",
-    )
-    init_fleet_parser.add_argument(
-        "--gpus",
-        type=str,
-        default=None,
-        help="Optional comma-separated GPU ids override",
-    )
+    init_fleet_parser.add_argument("--tag", type=str, required=True, help="Run tag used to name worker branches")
+    init_fleet_parser.add_argument("--gpus", type=str, default=None, help="Optional comma-separated GPU ids override")
     init_fleet_parser.add_argument(
         "--create-worktrees",
         action="store_true",
         help="Create git worktrees for each worker",
     )
 
-    plan_parser = subparsers.add_parser(
-        "plan", help="Create a scientific experiment plan"
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Single-command setup: env check, data prep, fleet init, optional warm-start",
     )
-    plan_parser.add_argument(
-        "--hypothesis-id", type=str, default=None, help="Optional explicit hypothesis"
-    )
-
-    dispatch_parser = subparsers.add_parser(
-        "dispatch", help="Dispatch one run per free GPU"
-    )
-    dispatch_parser.add_argument(
-        "--gpus",
-        type=str,
+    bootstrap_parser.add_argument("--tag", type=str, required=True, help="Run tag for the fleet")
+    bootstrap_parser.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU ids")
+    bootstrap_parser.add_argument("--create-worktrees", action="store_true", help="Create git worktrees")
+    bootstrap_parser.add_argument(
+        "--warm-start",
+        type=Path,
         default=None,
-        help="Optional comma-separated GPU ids override",
-    )
-    dispatch_parser.add_argument(
-        "--hypothesis-id",
-        type=str,
-        default=None,
-        help="Optional explicit hypothesis to dispatch",
-    )
-    dispatch_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print launch commands without starting runs",
-    )
-
-    record_parser = subparsers.add_parser(
-        "record", help="Record a run back into the knowledge base"
-    )
-    record_parser.add_argument(
-        "--plan", type=Path, required=True, help="Path to experiment plan JSON"
-    )
-    record_parser.add_argument(
-        "--metadata", type=Path, required=True, help="Path to run metadata JSON"
-    )
-    record_parser.add_argument(
-        "--analysis",
-        type=str,
-        required=True,
-        help="Scientific interpretation of the outcome",
-    )
-    record_parser.add_argument(
-        "--status",
-        type=str,
-        choices=["keep", "discard", "replicate", "crash"],
-        required=True,
-        help="Scientific disposition for the experiment",
+        help="Path to a prior results.tsv to seed knowledge base from",
     )
 
     return parser.parse_args()
@@ -1645,7 +1581,7 @@ def main() -> None:
     AGGREGATE_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.command == "briefing":
-        brief = build_research_brief()
+        brief = build_research_brief(effective_result_rows(collect_experiments()))
         brief.save(BRIEF_PATH)
         print(f"Wrote research brief to {BRIEF_PATH.relative_to(ROOT)}")
         return
@@ -1667,32 +1603,19 @@ def main() -> None:
     if args.command == "init-fleet":
         manifest = init_fleet(args.tag, args.gpus, args.create_worktrees)
         print(f"Wrote fleet manifest to {FLEET_MANIFEST_PATH.relative_to(ROOT)}")
-        print(f"Wrote main prompt to {Path(manifest.main_prompt_path).relative_to(ROOT)}")
+        print(f"Observer prompt: {Path(manifest.observer_prompt_path).relative_to(ROOT)}")
+        print(f"Tool-builder prompt: {Path(manifest.tool_builder_prompt_path).relative_to(ROOT)}")
         for worker in manifest.workers:
-            if worker.prompt_path:
-                print(f"{worker.worker_id}: {Path(worker.prompt_path).relative_to(ROOT)}")
+            print(f"{worker.worker_id}: {Path(worker.prompt_path).relative_to(ROOT)}")
         return
 
-    if args.command == "plan":
-        plan = build_plan(BRIEF_PATH, args.hypothesis_id)
-        plan_path = PLANS_DIR / f"{plan.experiment_id}.json"
-        plan.save(plan_path)
-        print(f"Wrote experiment plan to {plan_path.relative_to(ROOT)}")
-        print(plan.run_command)
-        return
-
-    if args.command == "dispatch":
-        dispatch_runs(args.gpus, args.hypothesis_id, args.dry_run)
-        return
-
-    if args.command == "record":
-        result = record_result(args.plan, args.metadata, args.analysis, args.status)
-        result_path = (
-            args.plan.parent.parent / "runs" / result.experiment_id / "result.json"
-        ).resolve()
-        result.save(result_path)
-        sync_artifacts()
-        print(f"Wrote experiment result to {result_path.relative_to(ROOT)}")
+    if args.command == "bootstrap":
+        bootstrap(
+            tag=args.tag,
+            gpus_arg=args.gpus,
+            create_worktrees=args.create_worktrees,
+            warm_start_source=args.warm_start,
+        )
         return
 
 

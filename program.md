@@ -4,23 +4,18 @@ This is an experiment to have the LLM do its own research.
 
 ## Setup
 
-Note: this program assumes the repo is git-initialized. If `.git` has been intentionally removed during a reorganization, do not follow the branch/worktree/reset steps yet. Re-enable that flow only after `git init` and a baseline commit.
+To set up a new experiment:
 
-This repo is git-backed again and the intended multi-agent mode is git worktrees. The canonical remote is `git@github.com:kyle-compute/autoresearch-cuda.git`. If you are running a multi-GPU/autoresearch-org setup, do not put every worker on one shared checkout. Use one git worktree per worker via `orchestrator.py init-fleet --create-worktrees`, and keep each worker inside its assigned worktree/branch.
-
-To set up a new experiment, work with the user to:
-
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar29`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
-Once you get confirmation, kick off the experimentation.
+Once setup is done, kick off the experimentation loop below.
 
 ## Experimentation
 
@@ -41,6 +36,8 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+
+**Think scientifically**: Before each experiment, form a hypothesis about *why* the change should help. After each experiment, interpret the result — did it match your prediction? What does that tell you about what to try next? Use your results to build a mental model of what matters in this training setup. Let your experiments inform each other rather than trying random changes.
 
 ## Output format
 
@@ -93,14 +90,18 @@ d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar29` or `autoresearch/mar29-gpu0`).
 
 If you are in fleet mode, interpret that strictly:
 
-- the main agent stays in the repo root
+- the observer agent stays in the repo root
+- the tool-builder also stays in the repo root
 - each worker agent operates only in its own git worktree
 - each worker branch should map to one worker identity, such as `autoresearch/<tag>-gpu0`
 - workers should not edit the root checkout directly
+- the observer controls dispatch by editing `research/research_brief.json`
+- workers execute assigned hypotheses; they do not self-dispatch new experiment families
+- workers should treat the generic autonomous loop below as background context only; their binding instructions come from the generated fleet Markdown
 
 LOOP FOREVER:
 
@@ -115,6 +116,12 @@ LOOP FOREVER:
 9. If val_bpb is equal or worse, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+
+In fleet mode, reinterpret the loop by role. This overrides the generic loop above whenever there is a conflict:
+
+- Observer: maintain `research/search_model.md`, update `research/research_brief.json` `hypothesis_queue`, assign hypotheses to idle workers, decide keep/discard/crash at the fleet level, and run `uv run python orchestrator.py sync` after each dispatch cycle.
+- Tool-builder: watch `research/tools/registry.json`, publish reusable helper scripts under `research/tools/published/`, and mark requested tools as published once they are usable.
+- GPU worker: read the generated assignment Markdown, execute the assigned hypothesis on the assigned GPU, capture logs and metrics, report the outcome, and then wait for the next observer dispatch. Workers do not choose new experiment families and should not make the final keep/discard decision for the fleet unless explicitly told to.
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
