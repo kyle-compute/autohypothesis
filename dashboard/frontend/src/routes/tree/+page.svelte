@@ -2,7 +2,6 @@
 	import { onMount } from 'svelte';
 	import type { Experiment } from '$lib/types';
 	import { fetchExperiments } from '$lib/api';
-	import { connectSSE } from '$lib/stores.svelte';
 	import RunGraph from '$lib/components/RunGraph.svelte';
 
 	let experiments: Experiment[] = $state([]);
@@ -14,8 +13,6 @@
 
 	onMount(async () => {
 		experiments = await fetchExperiments();
-		const disconnect = connectSSE((exp) => { experiments = [...experiments, exp]; });
-		return disconnect;
 	});
 
 	function onSelectNode(exp: Experiment | null) {

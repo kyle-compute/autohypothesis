@@ -2,10 +2,8 @@
 	import { onMount } from 'svelte';
 	import type { Experiment, KarpathyOriginal } from '$lib/types';
 	import { fetchExperiments, fetchDiff, fetchKarpathyOriginal } from '$lib/api';
-	import { connectSSE } from '$lib/stores.svelte';
 	import DiffViewer from '$lib/components/DiffViewer.svelte';
 	import HyperparamDiff from '$lib/components/HyperparamDiff.svelte';
-	// import RunGraph from '$lib/components/RunGraph.svelte';
 
 	let experiments: Experiment[] = $state([]);
 	let karpathyRuns: KarpathyOriginal[] = $state([]);
@@ -19,8 +17,6 @@
 		[experiments, karpathyRuns] = await Promise.all([fetchExperiments(), fetchKarpathyOriginal()]);
 		const ownKept = experiments.filter(e => e.status === 'keep' && !isBenchmark(e) && !isKarpathyRun(e));
 		if (ownKept.length > 0) selectedExp = ownKept.reduce((a, b) => a.val_bpb < b.val_bpb ? a : b);
-		const disconnect = connectSSE((exp) => { experiments = [...experiments, exp]; });
-		return disconnect;
 	});
 
 	$effect(() => {
