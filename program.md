@@ -62,33 +62,78 @@ Note that the script is configured to always stop after 5 minutes, so depending 
 grep "^val_bpb:" run.log
 ```
 
-## Logging results
+## Recording experiments (dashboard integration)
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+After every run (success or crash), record an `ExperimentRecord` to `experiments.jsonl`.
+This file is the single source of truth for the dashboard — it reads this file and
+renders the interactive experiment graph.
 
-The TSV has a header row and 5 columns:
+Use `schema.py` to create and append the record:
 
+```python
+import subprocess
+from schema import ExperimentRecord, append_jsonl, load_records, next_id, current_best, git_short_hash, git_diff_stat, git_diff_hash, utc_now_iso
+
+# After parsing run.log output:
+best = current_best("experiments.jsonl")
+status = "keep" if val_bpb < best else "discard"  # or "crash" if it crashed
+delta = val_bpb - best if best != float("inf") else 0.0
+
+record = ExperimentRecord(
+    id=next_id("experiments.jsonl"),
+    commit=git_short_hash(),
+    parent_commit=parent_commit,       # from git rev-parse --short HEAD~1 (before reset)
+    timestamp=utc_now_iso(),
+    status=status,
+    description="what you tried",
+
+    val_bpb=val_bpb,
+    delta=delta,
+
+    num_steps=num_steps,
+    training_seconds=training_seconds,
+    total_seconds=total_seconds,
+    mfu_percent=mfu_percent,
+    total_tokens_M=total_tokens_m,
+
+    peak_vram_gb=peak_vram_mb / 1024,
+    num_params_M=num_params_m,
+    depth=depth,
+
+    train_bpb=train_bpb,               # final training loss (if available, else None)
+    bpb_at_checkpoints=checkpoints,    # val_bpb sampled at 25%, 50%, 75%, 100% of training
+    still_improving=still_improving,    # was loss still dropping in last 25% of steps?
+    tokens_per_second=tok_per_sec,      # throughput (if available, else None)
+
+    diff_stat=git_diff_stat(),
+    diff_hash=git_diff_hash(),
+)
+
+# Add diff_text for inline rendering in the dashboard (not in ExperimentRecord schema)
+d = record.to_dict()
+try:
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD~1", "--", "train.py"],
+        capture_output=True, text=True, timeout=5,
+    )
+    d["diff_text"] = diff_result.stdout or ""
+except Exception:
+    d["diff_text"] = ""
+
+append_jsonl("experiments.jsonl", d)
 ```
-commit	val_bpb	memory_gb	status	description
-```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+**Key rules:**
+- Write the record BEFORE doing `git reset` (on discard), so the commit hash is still valid.
+- The `parent_commit` field is what links experiments into a tree in the dashboard.
+- The `description` field should be a concise summary of what you changed and why.
+- For crashes, set `val_bpb=0.0`, `delta=0.0`, and fill what you can. Use status `"crash"`.
+- `experiments.jsonl` should NOT be git-committed — leave it untracked.
+- `diff_text` is appended outside the schema so the dashboard can render inline diffs.
 
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
-
-`results.tsv` is the compact operator log. It is not the `/history` visualization source of truth.
+**Convergence tracking:** To populate the convergence chart and "still improving" badge:
+- `bpb_at_checkpoints`: Sample `val_bpb` at 25%, 50%, 75%, and 100% of training steps. If not feasible, pass `[]`.
+- `still_improving`: Set to `True` if the loss was still decreasing in the last 25% of steps. Parse from run.log or estimate from the last few logged losses.
 
 In fleet mode, the visualization contract is:
 
@@ -122,7 +167,7 @@ LOOP FOREVER:
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
 5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+7. Record the experiment to `experiments.jsonl` (see "Recording experiments" above; do NOT git-commit this file)
 8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 9. If val_bpb is equal or worse, you git reset back to where you started
 
