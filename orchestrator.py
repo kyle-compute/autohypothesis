@@ -598,21 +598,31 @@ def materialize_fleet_workers(
             continue
         worktree_path = Path(manifest_worker.worktree_path)
         missing_worktree = not worktree_path.exists()
+        shared_research_ok = has_shared_research_mount(worktree_path)
+        state = "idle"
+        note = None
+        if missing_worktree:
+            state = "missing_worktree"
+            note = (
+                "Run `uv run python orchestrator.py init-fleet --create-worktrees` to materialize this worker."
+            )
+        elif not shared_research_ok:
+            state = "missing_shared_research"
+            note = (
+                "Shared `research/` mount is unavailable in this worktree. "
+                "Run `uv run python orchestrator.py sync` or remove the conflicting worktree-local `research/` path."
+            )
         merged.append(
             WorkerStatus(
                 worker_id=manifest_worker.worker_id,
                 node_id="",
                 gpu_id=str(manifest_worker.gpu_id),
                 run_id=None,
-                state="missing_worktree" if missing_worktree else "idle",
+                state=state,
                 updated_at=manifest.created_at,
                 title=manifest_worker.current_title,
                 hypothesis_id=manifest_worker.current_hypothesis_id,
-                notes=(
-                    "Run `uv run python orchestrator.py init-fleet --create-worktrees` to materialize this worker."
-                    if missing_worktree
-                    else None
-                ),
+                notes=note,
                 paths={
                     "worktree_path": manifest_worker.worktree_path,
                     "prompt_path": manifest_worker.prompt_path,
@@ -646,7 +656,7 @@ def is_worker_active(worker: WorkerStatus) -> bool:
 
 
 def is_worker_dispatchable(worker: WorkerStatus) -> bool:
-    return worker.state not in {"missing_worktree"} and not is_worker_active(worker)
+    return worker.state not in {"missing_worktree", "missing_shared_research"} and not is_worker_active(worker)
 
 
 def collect_experiments() -> list[AggregateExperiment]:
@@ -1192,7 +1202,8 @@ def render_gpu_worker_protocol() -> str:
         "- Run exactly one experiment at a time on your assigned GPU.\n"
         "- Use `CUDA_VISIBLE_DEVICES=<gpu> uv run train.py > run.log 2>&1` so your run stays isolated.\n"
         "- Your default job is execution and reporting, not fleet-level decision making.\n"
-        "- Always write shared artifacts under the repo-root `research/` tree, never under a worktree-local `research/` directory.\n"
+        "- Your worktree should expose `research/` as a shared symlink into the repo-root research state. Use that `research/` path directly from the worktree.\n"
+        "- If `research/` is missing or is a local directory instead of the shared mount, stop and fix the worktree before running an experiment.\n"
         "- Capture metrics, logs, and run artifacts under `research/runs/` for every completed experiment. This is the visualization contract.\n"
         "- One finished experiment must be associated with `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md`, which are authored by the observer before dispatch, plus `research/runs/<experiment_id>/config.json`, `metadata.json`, `result.json`, and `events.jsonl`.\n"
         "- The plan file must include `experiment_id`, `created_at`, `based_on_commit`, `worker_id`, and a `hypothesis` object with `hypothesis_id`, `title`, and `rationale`.\n"
@@ -1236,11 +1247,11 @@ def render_worker_start(worker: FleetWorker) -> str:
         "Role: `gpu-worker`\n"
         f"Agent: `{worker.worker_id}`\n\n"
         "Paths:\n"
-        f"- `ROOT` = current checkout root\n"
-        f"- `WORKTREE` = `{display_path(Path(worker.worktree_path))}`\n"
-        f"- `RESEARCH` = `{display_path(RESEARCH_DIR)}`\n"
-        f"- `TOOLS` = `{display_path(PUBLISHED_TOOLS_DIR)}`\n"
-        f"- `SEARCH_MODEL` = `{display_path(SEARCH_MODEL_PATH)}`\n\n"
+        "- `CHECKOUT_ROOT` = current checkout root (this worker's git worktree)\n"
+        "- `SHARED_RESEARCH` = `research/` from this checkout root; it should resolve to the shared repo-root research state\n"
+        "- `TOOLS` = `research/tools/published`\n"
+        "- `SEARCH_MODEL` = `research/search_model.md`\n\n"
+        "Before reading further: verify that `research/` exists in this worktree and is the shared research mount. If not, stop and repair the worktree.\n\n"
         "Read exactly in this order:\n"
         f"1. `{display_path(assignment_path)}`\n"
         f"2. `{display_path(GPU_WORKER_PROTOCOL_PATH)}`\n"
@@ -1383,14 +1394,15 @@ def render_worker_assignment(
     peer_outcomes = recent_peer_outcomes(experiments, worker.worker_id)
     assigned = hypotheses_for_worker(brief, worker.worker_id)
     worktree_exists = Path(worker.worktree_path).exists()
+    shared_research_ok = has_shared_research_mount(Path(worker.worktree_path))
 
     lines = [
         f"# Worker Assignment: {worker.worker_id}",
         "",
-        f"Worktree: `{display_path(Path(worker.worktree_path))}`",
+        "Worktree: current checkout root",
         f"Branch: `{worker.branch}`",
         f"GPU: `{worker.gpu_id}`",
-        f"Shared research root: `{display_path(RESEARCH_DIR)}`",
+        "Shared research path from this worktree: `research/`",
         "",
         "## Assignment Source",
         "- Observer dispatch is sourced from `research/research_brief.json`.",
@@ -1403,7 +1415,9 @@ def render_worker_assignment(
         "",
         "## Worktree Status",
         (
-            "- Worktree exists and is ready."
+            "- Worktree exists and the shared `research/` mount is ready."
+            if worktree_exists and shared_research_ok
+            else "- Worktree exists, but shared `research/` is unavailable. Stop and repair the worktree before running."
             if worktree_exists
             else "- Worktree is missing. Do not start this worker until `uv run python orchestrator.py init-fleet --create-worktrees` has recreated it."
         ),
@@ -1524,6 +1538,7 @@ def sync_artifacts() -> dict[str, Any]:
     registry = ensure_registry()
 
     manifest = load_fleet_manifest()
+    ensure_manifest_shared_research_mounts(manifest)
     experiments = collect_experiments()
     live_workers = read_live_workers()
     workers = materialize_fleet_workers(manifest, live_workers)
@@ -1613,6 +1628,44 @@ def ensure_worktree(branch: str, worktree_path: Path) -> None:
     subprocess.run(cmd, cwd=ROOT, check=True)
 
 
+def has_shared_research_mount(worktree_path: Path) -> bool:
+    research_path = worktree_path / "research"
+    if not research_path.exists():
+        return False
+    try:
+        return research_path.resolve() == RESEARCH_DIR.resolve()
+    except OSError:
+        return False
+
+
+def ensure_shared_research_mount(worktree_path: Path) -> bool:
+    if not worktree_path.exists():
+        return False
+    research_path = worktree_path / "research"
+    desired_target = Path(os.path.relpath(RESEARCH_DIR, start=worktree_path))
+    if research_path.is_symlink():
+        try:
+            if research_path.resolve() == RESEARCH_DIR.resolve():
+                return True
+        except OSError:
+            pass
+        research_path.unlink()
+    elif research_path.exists():
+        return has_shared_research_mount(worktree_path)
+    try:
+        research_path.symlink_to(desired_target, target_is_directory=True)
+    except FileExistsError:
+        return has_shared_research_mount(worktree_path)
+    return has_shared_research_mount(worktree_path)
+
+
+def ensure_manifest_shared_research_mounts(manifest: FleetManifest | None) -> None:
+    if manifest is None:
+        return
+    for worker in manifest.workers:
+        ensure_shared_research_mount(Path(worker.worktree_path))
+
+
 def init_fleet(tag: str, gpus_arg: str | None, create_worktrees: bool) -> FleetManifest:
     gpu_ids = get_gpu_ids(gpus_arg)
     workers = []
@@ -1623,6 +1676,7 @@ def init_fleet(tag: str, gpus_arg: str | None, create_worktrees: bool) -> FleetM
         prompt_path = WORKER_PROMPTS_DIR / f"{worker_id}.md"
         if create_worktrees:
             ensure_worktree(branch, worktree_path)
+        ensure_shared_research_mount(worktree_path)
         workers.append(
             FleetWorker(
                 worker_id=worker_id,

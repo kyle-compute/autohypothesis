@@ -149,6 +149,7 @@ If you are in fleet mode, interpret that strictly:
 - the observer agent stays in the repo root
 - the tool-builder also stays in the repo root
 - each worker agent operates only in its own git worktree
+- each worker worktree should expose `research/` as the shared repo-root research state, not as an isolated local directory
 - each worker branch should map to one worker identity, such as `autoresearch/<tag>-gpu0`
 - workers should not edit the root checkout directly
 - the observer controls dispatch by editing `research/research_brief.json`

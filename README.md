@@ -131,6 +131,7 @@ What this gives you:
 - `research/fleet/assignments/` and `research/fleet/protocols/` — generated Markdown contracts for every role
 - `worktrees/worker-gpu*` — isolated git worktrees so parallel agents can edit `train.py` without conflicts
 - shared `research/` state that every worker reads before running
+- each worker worktree exposes that shared state at `research/` via a symlink, so the worker can read/write the canonical artifact bundle from inside its own checkout
 
 The intended loop is:
 
