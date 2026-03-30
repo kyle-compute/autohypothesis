@@ -112,6 +112,7 @@ The semantics are:
 - The observer authors `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md` before dispatch.
 - The worker records execution artifacts under `research/runs/<experiment_id>/`.
 - The worker writes provisional execution status only: `completed` or `failed`.
+- If a run crashes before a real validation metric exists, the worker or observer must still leave a numeric crash footprint in `result.json`: `metrics.val_bpb = 0.0`, and if no memory metric exists, `metrics.peak_vram_mb = 0.0`.
 - The observer stamps the terminal fleet decision in `result.json` as `decision_status`: `keep`, `discard`, `crash`, or `replicate`.
 - Only after that observer decision and a `sync` should the run be treated as final in `results.tsv` and `/history`.
 
@@ -182,7 +183,7 @@ In fleet mode, reinterpret the loop by role. This overrides the generic loop abo
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, mark it as `crash`, ensure the artifact bundle still includes `result.json.metrics.val_bpb = 0.0` and `metrics.peak_vram_mb = 0.0` when no real values exist, run `sync`, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 

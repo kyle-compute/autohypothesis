@@ -167,6 +167,8 @@ For `/history` to work, workers need to leave behind one artifact bundle per exp
 - `research/runs/<experiment_id>/result.json`
 - `research/runs/<experiment_id>/events.jsonl`
 
+Crash runs are not exempt from this contract. If a run fails before a real validation metric exists, the artifact bundle should still leave `result.json.metrics.val_bpb = 0.0`, and if no memory metric exists, `metrics.peak_vram_mb = 0.0`, so the crash still appears in `/history`.
+
 Recommended terminal layout on a 2x A100 box:
 
 1. Terminal 1: repo root, run the `main` agent on `program.md` until fleet handoff is complete

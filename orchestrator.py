@@ -739,7 +739,8 @@ def collect_experiments() -> list[AggregateExperiment]:
         if not recorded_at and latest_event is not None:
             recorded_at = latest_event.get("recorded_at")
         notes = result.get("analysis", "")
-        metrics = result.get("metrics") or metadata.get("metrics") or {}
+        raw_metrics = result.get("metrics") or metadata.get("metrics") or {}
+        metrics = dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
         gpu_name = (
             metadata.get("runtime", {}).get("gpu_name")
             or result.get("gpu_name")
@@ -763,6 +764,12 @@ def collect_experiments() -> list[AggregateExperiment]:
         diff_hash = runtime_payload.get("diff_hash") or result.get("diff_hash") or ""
         if not recorded_at:
             recorded_at = created_at
+        if status == "crash":
+            metrics.setdefault("val_bpb", 0.0)
+            if not _has_numeric_value(metrics.get("peak_vram_mb")) and not _has_numeric_value(
+                metrics.get("peak_vram_gb")
+            ):
+                metrics["peak_vram_mb"] = 0.0
 
         validation_errors: list[str] = []
         if status in {"keep", "discard", "crash", "replicate"}:
@@ -1161,6 +1168,7 @@ def render_observer_protocol(manifest: FleetManifest) -> str:
         "- Treat run artifacts as mandatory, not optional. Completed runs are only visible in `/history` after the worker writes the run bundle, the observer stamps `decision_status`, and you run `sync`.\n"
         "- Every dispatched run should also have a scientific decision markdown companion at `research/plans/<experiment_id>.md`.\n"
         "- The minimum lineage fields you should expect in a finished run are `commit`, `parent_commit`, `title`, `execution_status`, `decision_status`, concise `analysis`, and final `metrics.val_bpb`.\n"
+        "- Crash decisions must still leave a numeric metric footprint in `result.json`: write `metrics.val_bpb = 0.0`, and if no memory number exists write `metrics.peak_vram_mb = 0.0`, so the run remains visible in `/history`.\n"
         "- After changing the queue, run `uv run python orchestrator.py sync` so worker assignments regenerate.\n"
         "- Keep `research/search_model.md` current. That file is your scratchpad and theory ledger.\n"
         "- Use the tool-builder only when the fleet needs a reusable script or analysis helper.\n\n"
@@ -1209,7 +1217,9 @@ def render_gpu_worker_protocol() -> str:
         "- The plan file must include `experiment_id`, `created_at`, `based_on_commit`, `worker_id`, and a `hypothesis` object with `hypothesis_id`, `title`, and `rationale`.\n"
         "- Before editing `train.py`, record `parent_commit` as the current HEAD of your worker branch. Make a dedicated experiment commit before training so `commit` and `parent_commit` are explicit.\n"
         "- The plan markdown is the observer-owned scientific note for the run. It should capture the hypothesis, reference config, planned intervention, and predicted outcome before training starts.\n"
-        "- The result file must include a provisional execution `status` (`completed` or `failed`), `recorded_at`, `commit`, `parent_commit`, `title`, concise `analysis`, optional `outcome`, and a `metrics` object containing at least `val_bpb`, `peak_vram_mb`, `num_steps`, `training_seconds`, and `total_seconds` when available. The observer stamps the terminal status before the run is treated as final.\n"
+        "- The result file must include a provisional execution `status` (`completed` or `failed`), `recorded_at`, `commit`, `parent_commit`, `title`, concise `analysis`, optional `outcome`, and a `metrics` object.\n"
+        "- Always write a numeric `metrics.val_bpb`. If the run crashes before any real metric exists, write `metrics.val_bpb = 0.0` so the crash is still exported to `experiments.jsonl`.\n"
+        "- If the run crashes before memory metrics are available, write `metrics.peak_vram_mb = 0.0`. Include `num_steps`, `training_seconds`, and `total_seconds` when available.\n"
         "- `metadata.json` should capture runtime identity such as `worker_id`, `gpu_id`, `gpu_name`, and any stable metrics you already know before the final decision.\n"
         "- `events.jsonl` should at minimum append `run_started` and then `run_completed` or `run_failed`; add `heartbeat` only if it helps monitoring.\n"
         "- After writing execution artifacts, stop. Do not reset or advance the branch until the observer stamps `decision_status` and the next assignment tells you how to proceed.\n"
@@ -1262,11 +1272,25 @@ def render_worker_start(worker: FleetWorker) -> str:
 def render_legacy_main_prompt() -> str:
     return (
         "# Main Agent Bootstrap\n\n"
-        "Use this prompt for the top-level orchestrator before the fleet exists.\n\n"
-        "1. Read `program.md` and establish the baseline on this hardware.\n"
-        "2. Record the best-known baseline config locally.\n"
-        "3. Initialize the fleet once the baseline is established.\n"
-        f"4. Hand off to `{display_path(OBSERVER_PROMPT_PATH)}` for N+2 fleet dispatch.\n"
+        "Use this prompt for the top-level orchestrator before the fleet exists. "
+        "This is a concrete bootstrap spec, not a generic suggestion.\n\n"
+        "Read `README.md` for operator context, then read `program.md`, and execute this sequence exactly:\n"
+        "1. Verify the environment, data, and git state.\n"
+        "2. Confirm that `train.py` matches the untouched Karpathy baseline in this repo and run/store that baseline result on this exact hardware.\n"
+        "3. Reproduce and store the Karpathy best-known configuration on this exact hardware as a benchmark comparison point. Treat that run as a benchmark artifact, not as the live starting point for local search.\n"
+        "4. If the benchmark step required any temporary code or config changes, restore `train.py` to the untouched baseline version immediately after that benchmark run. The baseline `train.py` must be the version the research fleet inherits.\n"
+        "5. Treat the restored baseline config as the active reference until a locally kept run from this repo improves it. Do not branch local research from the benchmark config.\n"
+        "6. Initialize the observer + tool-builder + worker fleet, create worker worktrees, and refresh shared state.\n"
+        f"7. Hand off to `{display_path(OBSERVER_PROMPT_PATH)}` for observer-controlled N+2 research dispatch.\n\n"
+        "Bootstrap outputs that must exist before handoff:\n"
+        "- a stored baseline run from the untouched Karpathy `train.py`\n"
+        "- a stored Karpathy best-known benchmark run on the same hardware\n"
+        "- both runs represented by the canonical artifact bundle so they can appear in `/history` after `sync`\n\n"
+        "Before handoff, the repo should be in this state:\n"
+        "- baseline run stored locally\n"
+        "- Karpathy best-known benchmark run stored locally\n"
+        "- baseline `train.py` restored and ready for local search\n"
+        "- fleet prompts/worktrees/shared `research/` state ready\n"
     )
 
 
@@ -1309,6 +1333,7 @@ def render_observer_assignment(
             "- The observer stamps the terminal `decision_status` into `result.json`; worker execution status is not the canonical fleet decision.",
             "- The observer may only reset or advance a worker branch after that worker is idle and has written its execution artifacts for the run.",
             "- Require the finished `result.json` to include `commit`, `parent_commit`, concise `analysis`, and final `metrics.val_bpb`.",
+            "- If the final decision is `crash`, ensure `result.json.metrics.val_bpb = 0.0` and `metrics.peak_vram_mb = 0.0` when no real metric is available so the crash still exports to `/history`.",
             "- If you need a reusable helper, add a tool request in `research/tools/registry.json` with: `tool_id`, `title`, `problem`, `requested_by`, and `status: requested`.",
         ]
     )
@@ -1439,7 +1464,7 @@ def render_worker_assignment(
                 f"- Run command: `CUDA_VISIBLE_DEVICES={worker.gpu_id} uv run train.py > run.log 2>&1`"
             )
             lines.append("- Before the run: confirm the observer has already created the matching `research/plans/<experiment_id>.json` and `research/plans/<experiment_id>.md`; create only `research/runs/<experiment_id>/` for execution artifacts.")
-            lines.append("- After the run: write `config.json`, `metadata.json`, `events.jsonl`, and `result.json` with `commit`, `parent_commit`, concise `analysis`, optional `outcome`, execution `status` (`completed` or `failed`), and final metrics. Treat the terminal fleet decision as provisional until the observer stamps `decision_status`.")
+            lines.append("- After the run: write `config.json`, `metadata.json`, `events.jsonl`, and `result.json` with `commit`, `parent_commit`, concise `analysis`, optional `outcome`, execution `status` (`completed` or `failed`), and final metrics. Always write a numeric `metrics.val_bpb`; for crashes with no real metric yet, write `0.0` so export does not drop the run. Treat the terminal fleet decision as provisional until the observer stamps `decision_status`.")
             lines.append("- After writing execution artifacts: stop and wait. Do not reset or advance the branch until the observer's next decision is visible in shared state.")
             lines.append("- The `/history` page is derived from these run artifacts after `uv run python orchestrator.py sync`; skipped artifacts mean an invisible run.")
             lines.append("- Report metrics, logs, and your interpretation back to shared state; do not self-dispatch a follow-up family.")
