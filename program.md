@@ -19,7 +19,7 @@ Before any long-running autonomous loop begins, the `main` agent must do this in
 
 1. Verify the environment, data, and git state.
 2. Establish the local hardware baseline from the unmodified baseline config in `train.py`.
-3. Reproduce the best-known Karpathy-style optimization on this same hardware as a benchmark comparison point and store it locally next to the baseline.
+3. Use `https://github.com/karpathy/autoresearch` as the upstream benchmark reference. If the best-known Karpathy-style optimization is not already pinned in local state, inspect that repo's docs, commit history, and relevant diffs to recover the best-known configuration, then reproduce it on this same hardware and store it locally next to the baseline. Record the upstream commit or provenance you used.
 4. Reset back to the baseline `train.py` after that benchmark comparison. Do not start autonomous search from the imported best-known optimization.
 5. Treat the baseline config as the active reference config until a locally kept run from this repository beats it.
 6. Initialize the observer + tool-builder + worker fleet.
@@ -44,7 +44,7 @@ The search should always start from the current reference configuration.
 
 - At the very beginning, the reference configuration is the baseline config.
 - The first run must establish the baseline on the target hardware.
-- The Karpathy best-known optimization is a stored benchmark comparison, not the live starting point for autonomous search.
+- The Karpathy best-known optimization comes from the upstream reference repo `https://github.com/karpathy/autoresearch` and is stored locally as a benchmark comparison, not as the live starting point for autonomous search.
 - After a locally authored run is kept, that kept config becomes the new best-known reference for future hypotheses.
 - When you branch new experiments, mutate the best-known reference config, not the original baseline.
 - Warm-start findings can inform your hypotheses, but they do not replace the local baseline. The active reference config only advances from locally kept runs in this repository.

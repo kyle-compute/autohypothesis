@@ -1277,7 +1277,7 @@ def render_legacy_main_prompt() -> str:
         "Read `README.md` for operator context, then read `program.md`, and execute this sequence exactly:\n"
         "1. Verify the environment, data, and git state.\n"
         "2. Confirm that `train.py` matches the untouched Karpathy baseline in this repo and run/store that baseline result on this exact hardware.\n"
-        "3. Reproduce and store the Karpathy best-known configuration on this exact hardware as a benchmark comparison point. Treat that run as a benchmark artifact, not as the live starting point for local search.\n"
+        "3. Use the upstream reference repo `https://github.com/karpathy/autoresearch` as the source of truth for the Karpathy benchmark. If the best-known run/config is not already pinned locally, inspect that repo's current docs, commit history, and relevant diffs to recover the best-known configuration, then reproduce and store it on this exact hardware as a benchmark comparison point. Record the upstream commit or provenance you used in the run note. Treat that run as a benchmark artifact, not as the live starting point for local search.\n"
         "4. If the benchmark step required any temporary code or config changes, restore `train.py` to the untouched baseline version immediately after that benchmark run. The baseline `train.py` must be the version the research fleet inherits.\n"
         "5. Treat the restored baseline config as the active reference until a locally kept run from this repo improves it. Do not branch local research from the benchmark config.\n"
         "6. Initialize the observer + tool-builder + worker fleet, create worker worktrees, and refresh shared state.\n"

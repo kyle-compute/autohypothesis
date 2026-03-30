@@ -20,6 +20,8 @@ Before the fleet starts, the `main` agent should store two comparison anchors lo
 - the untouched Karpathy baseline on this exact hardware
 - the best-known Karpathy-style optimized comparison on this exact hardware
 
+Use `https://github.com/karpathy/autoresearch` as the upstream benchmark reference for that second anchor. If the best-known run/config is not already pinned locally, the `main` agent should inspect the upstream repo's docs, commit history, and relevant diffs, then record the upstream commit or provenance it used when reproducing the benchmark.
+
 The reference configuration follows one rule:
 
 - start from the local baseline config
@@ -182,7 +184,7 @@ Recommended terminal layout on a 2x A100 box:
 For the top-level bootstrap, point the `main` agent at `program.md` and prompt it with:
 
 ```
-Read program.md and execute the full bootstrap flow: store the untouched Karpathy baseline on this hardware, store the best-known Karpathy-style optimized comparison on this hardware, reset back to the baseline train.py, then hand off to the observer/tool-builder/worker fleet for our own scientific search.
+Read program.md and execute the full bootstrap flow: store the untouched Karpathy baseline on this hardware, use https://github.com/karpathy/autoresearch as the upstream reference to recover and store the best-known Karpathy-style benchmark comparison on this hardware, reset back to the baseline train.py, then hand off to the observer/tool-builder/worker fleet for our own scientific search.
 ```
 
 After handoff:
