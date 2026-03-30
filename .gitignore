@@ -21,5 +21,6 @@ dev/
 
 # Results file
 results.tsv
+experiments.jsonl
 research/
 run.log

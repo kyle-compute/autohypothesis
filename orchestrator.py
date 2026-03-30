@@ -18,6 +18,7 @@ from schema import (
     AggregateExperiment,
     EmpiricalFinding,
     ExperimentConfig,
+    ExperimentRecord,
     FleetManifest,
     FleetWorker,
     Hypothesis,
@@ -30,6 +31,7 @@ from schema import (
     read_jsonl,
     utc_now_iso,
     write_json,
+    write_jsonl,
 )
 
 
@@ -64,6 +66,7 @@ FLEET_BRIEF_PATH = AGGREGATE_DIR / "fleet_brief.md"
 TOOLS_DIR = RESEARCH_DIR / "tools"
 PUBLISHED_TOOLS_DIR = TOOLS_DIR / "published"
 TOOLS_REGISTRY_PATH = TOOLS_DIR / "registry.json"
+EXPERIMENTS_JSONL_PATH = ROOT / "experiments.jsonl"
 RESULTS_TSV_PATH = ROOT / "results.tsv"
 PROGRESS_PNG_PATH = ROOT / "progress.png"
 STALE_HEARTBEAT_SECONDS = 180.0
@@ -126,6 +129,68 @@ def load_json(path: Path) -> dict[str, Any] | None:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_list(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [_safe_float(item) for item in value]
+
+
+def _dashboard_status(status: str) -> str:
+    return status if status in {"keep", "discard", "crash", "replicate"} else "discard"
+
+
+def _experiment_sort_key(item: AggregateExperiment) -> tuple[datetime, str]:
+    return (
+        parse_iso(item.recorded_at or item.created_at) or now_utc(),
+        item.experiment_id,
+    )
+
+
+def _derive_model_dim(config: dict[str, Any], metrics: dict[str, Any], depth: int, head_dim: int) -> int:
+    explicit = _safe_int(
+        metrics.get("model_dim")
+        or config.get("model_dim")
+        or config.get("dim")
+        or config.get("n_embd")
+    )
+    if explicit > 0:
+        return explicit
+    aspect_ratio = _safe_int(config.get("aspect_ratio"))
+    if aspect_ratio > 0 and depth > 0:
+        return depth * aspect_ratio
+    n_heads = _safe_int(metrics.get("n_heads") or config.get("n_heads"))
+    if n_heads > 0 and head_dim > 0:
+        return n_heads * head_dim
+    return 0
+
+
+def _derive_n_heads(config: dict[str, Any], metrics: dict[str, Any], model_dim: int, head_dim: int) -> int:
+    explicit = _safe_int(metrics.get("n_heads") or config.get("n_heads"))
+    if explicit > 0:
+        return explicit
+    if model_dim > 0 and head_dim > 0:
+        return model_dim // head_dim
+    return 0
 
 
 def load_fleet_manifest() -> FleetManifest | None:
@@ -566,12 +631,19 @@ def collect_experiments() -> list[AggregateExperiment]:
 
         run_payload = metadata.get("run", {})
         payload_identity = latest_event or {}
+        runtime_payload = metadata.get("runtime", {})
         worker_id = run_payload.get("worker_id") or payload_identity.get("worker_id", "")
         gpu_id = str(run_payload.get("gpu_id") or payload_identity.get("gpu_id", ""))
         commit = (
-            metadata.get("runtime", {}).get("commit")
+            runtime_payload.get("commit")
             or result.get("commit")
             or plan.get("based_on_commit", "")
+        )
+        parent_commit = (
+            result.get("parent_commit")
+            or runtime_payload.get("parent_commit")
+            or plan.get("based_on_commit")
+            or ""
         )
         created_at = (
             plan.get("created_at")
@@ -580,6 +652,28 @@ def collect_experiments() -> list[AggregateExperiment]:
         )
         recorded_at = result.get("recorded_at") or metadata.get("recorded_at")
         notes = result.get("analysis", "")
+        metrics = result.get("metrics") or metadata.get("metrics") or {}
+        gpu_name = (
+            metadata.get("runtime", {}).get("gpu_name")
+            or result.get("gpu_name")
+            or metrics.get("gpu_name")
+            or (f"GPU {gpu_id}" if gpu_id else "")
+        )
+        hypothesis_id = (
+            plan_hypothesis.get("hypothesis_id")
+            or result.get("hypothesis_id")
+            or metadata.get("run", {}).get("hypothesis_id")
+            or ""
+        )
+        rationale = (
+            plan_hypothesis.get("rationale")
+            or result.get("rationale")
+            or metadata.get("run", {}).get("rationale")
+            or ""
+        )
+        outcome = result.get("outcome") or plan_hypothesis.get("outcome") or ""
+        diff_stat = runtime_payload.get("diff_stat") or result.get("diff_stat") or ""
+        diff_hash = runtime_payload.get("diff_hash") or result.get("diff_hash") or ""
 
         experiments.append(
             AggregateExperiment(
@@ -587,13 +681,20 @@ def collect_experiments() -> list[AggregateExperiment]:
                 status=status,
                 title=title,
                 commit=commit,
+                parent_commit=parent_commit,
                 worker_id=worker_id or "",
                 gpu_id=gpu_id or "",
                 created_at=created_at,
                 recorded_at=recorded_at,
-                metrics=result.get("metrics") or metadata.get("metrics") or {},
+                metrics=metrics,
                 config=config,
                 notes=notes,
+                hypothesis_id=hypothesis_id,
+                rationale=rationale,
+                outcome=outcome,
+                gpu_name=gpu_name,
+                diff_stat=diff_stat,
+                diff_hash=diff_hash,
             )
         )
     return experiments
@@ -626,6 +727,106 @@ def effective_result_rows(experiments: list[AggregateExperiment]) -> list[Result
     if rows:
         write_results_tsv(rows)
     return rows
+
+
+def build_experiment_records(experiments: list[AggregateExperiment]) -> list[ExperimentRecord]:
+    terminal = [
+        item for item in experiments if item.status in {"keep", "discard", "crash", "replicate"}
+    ]
+    terminal.sort(key=_experiment_sort_key)
+
+    best_keep = math.inf
+    records: list[ExperimentRecord] = []
+    for index, item in enumerate(terminal, start=1):
+        metrics = item.metrics or {}
+        normalized_config = ExperimentConfig.from_dict(item.config or {}).to_dict()
+
+        val_bpb = _safe_float(metrics.get("val_bpb"))
+        previous_best = best_keep if math.isfinite(best_keep) else None
+        delta = 0.0 if previous_best is None else val_bpb - previous_best
+
+        status = _dashboard_status(item.status)
+        if status in {"keep", "replicate"} and val_bpb > 0:
+            best_keep = min(best_keep, val_bpb)
+
+        peak_vram_gb = _safe_float(metrics.get("peak_vram_gb"))
+        if peak_vram_gb <= 0.0:
+            peak_vram_gb = _safe_float(metrics.get("peak_vram_mb")) / 1024.0
+
+        depth = _safe_int(metrics.get("depth") or normalized_config.get("depth"))
+        head_dim = _safe_int(metrics.get("head_dim") or normalized_config.get("head_dim"))
+        model_dim = _derive_model_dim(normalized_config, metrics, depth, head_dim)
+        n_heads = _derive_n_heads(normalized_config, metrics, model_dim, head_dim)
+        checkpoint_values = _float_list(
+            metrics.get("bpb_at_checkpoints")
+            or metrics.get("val_bpb_checkpoints")
+            or metrics.get("checkpoints")
+        )
+
+        record = ExperimentRecord(
+            id=index,
+            commit=item.commit or item.experiment_id,
+            parent_commit=item.parent_commit,
+            timestamp=item.recorded_at or item.created_at,
+            status=status,
+            description=item.title.strip() or item.experiment_id,
+            val_bpb=val_bpb,
+            delta=delta,
+            num_steps=_safe_int(metrics.get("num_steps")),
+            training_seconds=_safe_float(metrics.get("training_seconds") or metrics.get("train_seconds")),
+            total_seconds=_safe_float(metrics.get("total_seconds")),
+            mfu_percent=_safe_float(metrics.get("mfu_percent")),
+            total_tokens_M=_safe_float(metrics.get("total_tokens_M") or metrics.get("total_tokens_m")),
+            peak_vram_gb=peak_vram_gb,
+            num_params_M=_safe_float(metrics.get("num_params_M")),
+            depth=depth,
+            train_bpb=_safe_float(
+                metrics.get("train_bpb") or metrics.get("train_loss") or metrics.get("loss"),
+                val_bpb,
+            ),
+            bpb_at_checkpoints=checkpoint_values,
+            still_improving=metrics.get("still_improving"),
+            improvement_rate=_safe_float(metrics.get("improvement_rate")),
+            tokens_per_second=_safe_int(
+                metrics.get("tokens_per_second") or metrics.get("tok_per_sec")
+            ),
+            diff_stat=item.diff_stat,
+            diff_hash=item.diff_hash,
+            gpu_name=item.gpu_name,
+            model_dim=model_dim,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            window_pattern=str(
+                metrics.get("window_pattern") or normalized_config.get("window_pattern") or ""
+            ),
+            total_batch_size=_safe_int(
+                metrics.get("total_batch_size") or normalized_config.get("total_batch_size")
+            ),
+            device_batch_size=_safe_int(
+                metrics.get("device_batch_size") or normalized_config.get("device_batch_size")
+            ),
+            matrix_lr=_safe_float(
+                metrics.get("matrix_lr") or normalized_config.get("matrix_lr")
+            ),
+            embedding_lr=_safe_float(
+                metrics.get("embedding_lr") or normalized_config.get("embedding_lr")
+            ),
+            weight_decay=_safe_float(
+                metrics.get("weight_decay") or normalized_config.get("weight_decay")
+            ),
+            warmdown_ratio=_safe_float(
+                metrics.get("warmdown_ratio") or normalized_config.get("warmdown_ratio")
+            ),
+            adam_betas=[_safe_float(item) for item in normalized_config.get("adam_betas", [])],
+            worker_id=item.worker_id,
+            gpu_id=item.gpu_id,
+            hypothesis_id=item.hypothesis_id,
+            rationale=item.rationale,
+            outcome=item.outcome,
+            notes=item.notes,
+        )
+        records.append(record)
+    return records
 
 
 def render_progress(rows: list[ResultRow], output_path: Path) -> None:
@@ -832,6 +1033,8 @@ def render_observer_protocol(manifest: FleetManifest) -> str:
         "- A dispatched hypothesis must set `status` to `dispatched` and `assigned_worker` to a worker id.\n"
         "- You own the fleet-level decision after each run: keep, discard, crash, replicate, and whether the branch should advance.\n"
         "- Workers may report metrics and suggested interpretation, but the observer makes the final decision of record.\n"
+        "- Treat run artifacts as mandatory, not optional. Completed runs are only visible in `/history` after workers write the plan + run bundle and you run `sync`.\n"
+        "- The minimum lineage fields you should expect in a finished run are `commit`, `parent_commit`, `title`, concise `analysis`, and final `metrics.val_bpb`.\n"
         "- After changing the queue, run `uv run python orchestrator.py sync` so worker assignments regenerate.\n"
         "- Keep `research/search_model.md` current. That file is your scratchpad and theory ledger.\n"
         "- Use the tool-builder only when the fleet needs a reusable script or analysis helper.\n\n"
@@ -873,7 +1076,12 @@ def render_gpu_worker_protocol() -> str:
         "- Run exactly one experiment at a time on your assigned GPU.\n"
         "- Use `CUDA_VISIBLE_DEVICES=<gpu> uv run train.py > run.log 2>&1` so your run stays isolated.\n"
         "- Your default job is execution and reporting, not fleet-level decision making.\n"
-        "- Capture metrics, logs, and run artifacts under `research/runs/` when applicable.\n"
+        "- Capture metrics, logs, and run artifacts under `research/runs/` for every completed experiment. This is the visualization contract.\n"
+        "- One finished experiment must leave behind: `research/plans/<experiment_id>.json`, `research/runs/<experiment_id>/config.json`, `metadata.json`, `result.json`, and `events.jsonl`.\n"
+        "- The plan file must include `experiment_id`, `created_at`, `based_on_commit`, `worker_id`, and a `hypothesis` object with `hypothesis_id`, `title`, and `rationale`.\n"
+        "- The result file must include `status`, `recorded_at`, `commit`, `parent_commit`, `title`, concise `analysis`, optional `outcome`, and a `metrics` object containing at least `val_bpb`, `peak_vram_mb`, `num_steps`, `training_seconds`, and `total_seconds` when available.\n"
+        "- `metadata.json` should capture runtime identity such as `worker_id`, `gpu_id`, `gpu_name`, and any stable metrics you already know before the final decision.\n"
+        "- `events.jsonl` should at minimum append `run_started` and then `run_completed` or `run_failed`; add `heartbeat` only if it helps monitoring.\n"
         "- Only write `results.tsv` or make the final keep/discard/crash decision if the assignment explicitly asks you to do so.\n"
         "- Read shared state before every run so you avoid duplicating peer work.\n"
     )
@@ -961,6 +1169,8 @@ def render_observer_assignment(
             "- Set `status` to `dispatched` and `assigned_worker` to the target worker id.",
             "- After edits, run `uv run python orchestrator.py sync` to regenerate assignments.",
             "- When a run is finished, mark the hypothesis `completed` or `abandoned`, add a short `outcome`, and decide keep/discard/crash/replicate for the fleet record.",
+            "- Do not count a run as dashboard-visible until the worker has written `research/plans/<experiment_id>.json` and the full `research/runs/<experiment_id>/` artifact bundle.",
+            "- Require the finished `result.json` to include `commit`, `parent_commit`, concise `analysis`, and final `metrics.val_bpb`.",
             "- If you need a reusable helper, add a tool request in `research/tools/registry.json` with: `tool_id`, `title`, `problem`, `requested_by`, and `status: requested`.",
         ]
     )
@@ -1071,7 +1281,10 @@ def render_worker_assignment(
             lines.append(
                 f"- Run command: `CUDA_VISIBLE_DEVICES={worker.gpu_id} uv run train.py > run.log 2>&1`"
             )
-            lines.append("- After the run: report metrics, logs, and your interpretation back to shared state; do not self-dispatch a follow-up family.")
+            lines.append("- Before the run: choose a unique `experiment_id` like `exp-YYYYMMDD-HHMMSS-worker-gpu0` and create `research/plans/<experiment_id>.json` plus `research/runs/<experiment_id>/`.")
+            lines.append("- After the run: write `config.json`, `metadata.json`, `events.jsonl`, and `result.json` with `commit`, `parent_commit`, concise `analysis`, optional `outcome`, and final metrics.")
+            lines.append("- The `/history` page is derived from these run artifacts after `uv run python orchestrator.py sync`; skipped artifacts mean an invisible run.")
+            lines.append("- Report metrics, logs, and your interpretation back to shared state; do not self-dispatch a follow-up family.")
             if item.outcome:
                 lines.append(f"- Prior outcome note: {item.outcome}")
 
@@ -1171,10 +1384,12 @@ def sync_artifacts() -> dict[str, Any]:
     live_workers = read_live_workers()
     workers = materialize_fleet_workers(manifest, live_workers)
     rows = effective_result_rows(experiments)
+    experiment_records = build_experiment_records(experiments)
     brief = build_research_brief(rows)
     brief.save(BRIEF_PATH)
 
     write_json(EXPERIMENTS_PATH, {"experiments": [item.to_dict() for item in experiments]})
+    write_jsonl(EXPERIMENTS_JSONL_PATH, [record.to_dict() for record in experiment_records])
     write_json(LEADERBOARD_PATH, build_leaderboard(experiments, workers, rows))
     render_progress(rows, PROGRESS_PNG_PATH)
 
@@ -1186,6 +1401,7 @@ def sync_artifacts() -> dict[str, Any]:
         "best_result": None,
         "paths": {
             "results_tsv": str(RESULTS_TSV_PATH),
+            "experiments_jsonl": str(EXPERIMENTS_JSONL_PATH),
             "progress_png": str(PROGRESS_PNG_PATH),
             "aggregate_experiments": str(EXPERIMENTS_PATH),
             "research_brief": str(BRIEF_PATH),

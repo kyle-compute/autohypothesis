@@ -88,6 +88,17 @@ c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
 d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 ```
 
+`results.tsv` is the compact operator log. It is not the `/history` visualization source of truth.
+
+In fleet mode, the visualization contract is:
+
+- Each completed run must create `research/plans/<experiment_id>.json`.
+- Each completed run must create `research/runs/<experiment_id>/config.json`, `metadata.json`, `result.json`, and `events.jsonl`.
+- `result.json` must include `commit`, `parent_commit`, concise `analysis`, optional `outcome`, and final `metrics.val_bpb`.
+- After runs complete, execute `uv run python orchestrator.py sync`. That exports root `experiments.jsonl`, which is what the local dashboard reads.
+
+If a worker only updates `results.tsv` and skips the run artifact bundle, the run will be missing from `/history`.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar29` or `autoresearch/mar29-gpu0`).
@@ -121,7 +132,7 @@ In fleet mode, reinterpret the loop by role. This overrides the generic loop abo
 
 - Observer: maintain `research/search_model.md`, update `research/research_brief.json` `hypothesis_queue`, assign hypotheses to idle workers, decide keep/discard/crash at the fleet level, and run `uv run python orchestrator.py sync` after each dispatch cycle.
 - Tool-builder: watch `research/tools/registry.json`, publish reusable helper scripts under `research/tools/published/`, and mark requested tools as published once they are usable.
-- GPU worker: read the generated assignment Markdown, execute the assigned hypothesis on the assigned GPU, capture logs and metrics, report the outcome, and then wait for the next observer dispatch. Workers do not choose new experiment families and should not make the final keep/discard decision for the fleet unless explicitly told to.
+- GPU worker: read the generated assignment Markdown, execute the assigned hypothesis on the assigned GPU, write the required `research/plans/` + `research/runs/` artifact bundle for that experiment, report the outcome, and then wait for the next observer dispatch. Workers do not choose new experiment families and should not make the final keep/discard decision for the fleet unless explicitly told to.
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
@@ -130,3 +141,17 @@ In fleet mode, reinterpret the loop by role. This overrides the generic loop abo
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Dashboard
+
+After a batch of runs has completed, regenerate the viewer input with:
+
+```bash
+uv run python orchestrator.py sync
+uv run uvicorn dashboard.server:app --host 127.0.0.1 --port 8000
+```
+
+Then open:
+
+- `/` for the latest-run summary
+- `/history` for the lineage graph

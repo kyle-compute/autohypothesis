@@ -61,6 +61,8 @@ uv run python orchestrator.py status
 
 In single-agent mode, the agent decides what experiments to run and logs results to `results.tsv`. In fleet mode, the observer controls dispatch and workers execute assigned hypotheses.
 
+For visualization, `results.tsv` is only the compact summary. The local dashboard reads root `experiments.jsonl`, which is exported by `uv run python orchestrator.py sync` from the run artifact bundle under `research/plans/` and `research/runs/`.
+
 ## Agent Fleet
 
 For an observer + tool-builder + multi-worker setup, initialize a fleet manifest and one worktree per GPU.
@@ -100,6 +102,29 @@ The intended loop is:
 3. Run one worker agent per GPU in its corresponding `worktrees/worker-gpu*` directory.
 4. Keep `uv run python orchestrator.py monitor --interval 5` running in the repo root so the shared briefs stay current.
 5. The observer edits `research/research_brief.json` to dispatch hypotheses, then runs `sync` to regenerate worker assignments.
+
+To inspect the completed run graph locally:
+
+```bash
+# regenerate root experiments.jsonl from run artifacts
+uv run python orchestrator.py sync
+
+# serve the local dashboard
+uv run uvicorn dashboard.server:app --host 127.0.0.1 --port 8000
+```
+
+Routes:
+
+- `/` — latest run summary
+- `/history` — lineage graph and detail panel
+
+For `/history` to work, workers need to leave behind one artifact bundle per experiment:
+
+- `research/plans/<experiment_id>.json`
+- `research/runs/<experiment_id>/config.json`
+- `research/runs/<experiment_id>/metadata.json`
+- `research/runs/<experiment_id>/result.json`
+- `research/runs/<experiment_id>/events.jsonl`
 
 Recommended terminal layout on a 2x A100 box:
 

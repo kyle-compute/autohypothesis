@@ -59,6 +59,30 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    content = "".join(
+        json.dumps(row, sort_keys=False, default=_json_default) + "\n" for row in rows
+    )
+    fd, tmp_path = tempfile.mkstemp(dir=file_path.parent, suffix=".tmp")
+    closed = False
+    try:
+        os.write(fd, content.encode())
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.replace(tmp_path, file_path)
+    except BaseException:
+        if not closed:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def append_jsonl(path: str | Path, payload: dict[str, Any]) -> None:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,16 +225,46 @@ class ExperimentRecord:
     train_bpb: float | None = None
     bpb_at_checkpoints: list[float] = field(default_factory=list)
     still_improving: bool | None = None
+    improvement_rate: float = 0.0
     tokens_per_second: int | None = None
     # Diff (optional)
     diff_stat: str = ""
     diff_hash: str = ""
+    # Platform and config (optional)
+    gpu_name: str = ""
+    model_dim: int = 0
+    n_heads: int = 0
+    head_dim: int = 0
+    window_pattern: str = ""
+    total_batch_size: int = 0
+    device_batch_size: int = 0
+    matrix_lr: float = 0.0
+    embedding_lr: float = 0.0
+    weight_decay: float = 0.0
+    warmdown_ratio: float = 0.0
+    adam_betas: list[float] = field(default_factory=list)
+    # Fleet/context metadata (optional)
+    worker_id: str = ""
+    gpu_id: str = ""
+    hypothesis_id: str = ""
+    rationale: str = ""
+    outcome: str = ""
+    notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), separators=(",", ":"))
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ExperimentRecord":
+        cleaned = _filter_kwargs(cls, payload)
+        if "adam_betas" in cleaned:
+            cleaned["adam_betas"] = list(cleaned["adam_betas"])
+        if "bpb_at_checkpoints" in cleaned:
+            cleaned["bpb_at_checkpoints"] = list(cleaned["bpb_at_checkpoints"])
+        return cls(**cleaned)
 
     def to_row(self) -> str:
         return "\t".join([
@@ -237,7 +291,7 @@ def load_records(path: str | Path) -> list[ExperimentRecord]:
     for line in p.read_text().splitlines():
         line = line.strip()
         if line:
-            records.append(ExperimentRecord(**json.loads(line)))
+            records.append(ExperimentRecord.from_dict(json.loads(line)))
     return records
 
 
@@ -365,10 +419,17 @@ class AggregateExperiment:
     worker_id: str
     gpu_id: str
     created_at: str
+    parent_commit: str = ""
     recorded_at: str | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    hypothesis_id: str = ""
+    rationale: str = ""
+    outcome: str = ""
+    gpu_name: str = ""
+    diff_stat: str = ""
+    diff_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
