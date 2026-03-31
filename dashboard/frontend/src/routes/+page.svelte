@@ -2,7 +2,6 @@
 	import { onMount } from 'svelte';
 	import type { Experiment } from '$lib/types';
 	import { fetchExperiments } from '$lib/api';
-	import { connectSSE } from '$lib/stores.svelte';
 
 	let experiments: Experiment[] = $state([]);
 	let latest: Experiment | null = $state(null);
@@ -12,12 +11,6 @@
 		latest = experiments.length > 0
 			? experiments.reduce((a, b) => a.id > b.id ? a : b)
 			: null;
-
-		const disconnect = connectSSE((exp) => {
-			experiments = [...experiments, exp];
-			latest = exp;
-		});
-		return disconnect;
 	});
 
 	let keptCount = $derived(experiments.filter(e => e.status === 'keep').length);

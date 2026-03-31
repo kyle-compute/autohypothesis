@@ -1,26 +1,31 @@
-import type { Experiment, DecisionMarkdown, ResearchBrief, TopExperiment, StrategyHitRate } from './types';
+import type { Experiment, KarpathyOriginal, DecisionMarkdown, ResearchBrief, TopExperiment, StrategyHitRate } from './types';
 
 export async function fetchExperiments(): Promise<Experiment[]> {
 	const res = await fetch('/api/experiments');
 	if (!res.ok) return [];
-	return res.json();
+	const raw: any[] = await res.json();
+	return raw.map((r, i) => ({
+		...r,
+		experiment_id: r.id,
+		id: r.ordinal ?? i + 1,
+	}));
 }
 
-export async function fetchExperiment(id: string): Promise<Experiment | null> {
-	const res = await fetch(`/api/experiments/${id}`);
+export async function fetchExperiment(experimentId: string): Promise<Experiment | null> {
+	const res = await fetch(`/api/experiments/${experimentId}`);
 	if (!res.ok) return null;
 	return res.json();
 }
 
-export async function fetchDiff(id: string): Promise<string> {
-	const res = await fetch(`/api/experiments/${id}/diff`);
+export async function fetchDiff(experimentId: string): Promise<string> {
+	const res = await fetch(`/api/experiments/${experimentId}/diff`);
 	if (!res.ok) return '';
 	const data = await res.json();
 	return data.diff || '';
 }
 
-export async function fetchDecisionMarkdown(id: string): Promise<DecisionMarkdown | null> {
-	const res = await fetch(`/api/experiments/${id}/decision-md`);
+export async function fetchDecisionMarkdown(experimentId: string): Promise<DecisionMarkdown | null> {
+	const res = await fetch(`/api/experiments/${experimentId}/decision-md`);
 	if (!res.ok) return null;
 	return res.json();
 }
@@ -43,8 +48,8 @@ export async function fetchStrategies(): Promise<StrategyHitRate[]> {
 	return res.json();
 }
 
-export async function fetchRunDetail(id: string): Promise<Record<string, any> | null> {
-	const res = await fetch(`/api/research/run/${id}`);
+export async function fetchRunDetail(experimentId: string): Promise<Record<string, any> | null> {
+	const res = await fetch(`/api/research/run/${experimentId}`);
 	if (!res.ok) return null;
 	return res.json();
 }
@@ -57,8 +62,8 @@ export interface ConfigDiff {
 	changes?: { key: string; old: any; new: any }[];
 }
 
-export async function fetchConfigDiff(id: string): Promise<ConfigDiff | null> {
-	const res = await fetch(`/api/research/config-diff/${id}`);
+export async function fetchConfigDiff(experimentId: string): Promise<ConfigDiff | null> {
+	const res = await fetch(`/api/research/config-diff/${experimentId}`);
 	if (!res.ok) return null;
 	return res.json();
 }
@@ -71,6 +76,12 @@ export interface LineageEdge {
 
 export async function fetchLineage(): Promise<LineageEdge[]> {
 	const res = await fetch('/api/research/lineage');
+	if (!res.ok) return [];
+	return res.json();
+}
+
+export async function fetchKarpathyOriginal(): Promise<KarpathyOriginal[]> {
+	const res = await fetch('/api/karpathy-original');
 	if (!res.ok) return [];
 	return res.json();
 }

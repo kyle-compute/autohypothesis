@@ -12,7 +12,11 @@ export function connectSSE(onExperiment: (exp: Experiment) => void): () => void 
 			const event = JSON.parse(e.data);
 			if (event.type === 'new_experiment') {
 				const { type, ...record } = event;
-				onExperiment(record as Experiment);
+				onExperiment({
+					...record,
+					experiment_id: record.id,
+					id: record.ordinal ?? 0,
+				} as Experiment);
 			}
 		} catch {
 			// ignore malformed events

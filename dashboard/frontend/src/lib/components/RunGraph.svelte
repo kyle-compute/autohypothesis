@@ -67,6 +67,23 @@
 		inferred: boolean;
 	}
 
+	// Pre-build lookup maps for O(1) parent resolution
+	let commitMap = $derived.by(() => {
+		const map = new Map<string, Experiment>();
+		for (const e of experiments) map.set(e.commit, e);
+		return map;
+	});
+	let childrenMap = $derived.by(() => {
+		const map = new Map<string, Experiment[]>();
+		for (const e of experiments) {
+			if (!e.parent_commit) continue;
+			const arr = map.get(e.parent_commit) || [];
+			arr.push(e);
+			map.set(e.parent_commit, arr);
+		}
+		return map;
+	});
+
 	let graphNodes = $derived.by((): GNode[] => {
 		if (experiments.length === 0) return [];
 
@@ -90,8 +107,7 @@
 			const isCrash = exp.status === 'crash';
 			const r = isKeep ? R_KEEP : isCrash ? R_CRASH : R_DISCARD;
 
-			// Param diff vs parent
-			const parent = experiments.find(p => p.commit === exp.parent_commit);
+			const parent = commitMap.get(exp.parent_commit);
 			const paramChanges: ParamChange[] = [];
 			if (parent) {
 				for (const key of HYPERPARAM_KEYS) {
@@ -104,7 +120,7 @@
 			}
 
 			return {
-				id: exp.id,
+				id: exp.experiment_id,
 				exp,
 				x, y, r,
 				fill: isKeep ? '#16A34A' : isCrash ? '#B45309' : 'rgba(220,38,38,0.12)',
@@ -119,21 +135,41 @@
 		for (const n of graphNodes) {
 			nodeById.set(n.id, n);
 		}
-		return lineageEdges
-			.filter(e => nodeById.has(e.from) && nodeById.has(e.to))
-			.map(e => {
-				const p = nodeById.get(e.from)!;
-				const n = nodeById.get(e.to)!;
-				const dx = n.x - p.x;
-				const dy = n.y - p.y;
-				return {
-					fromId: p.id,
-					toId: n.id,
-					path: `M${p.x},${p.y} C${p.x + dx * 0.4},${p.y + dy * 0.1} ${n.x - dx * 0.4},${n.y - dy * 0.1} ${n.x},${n.y}`,
-					kept: p.exp.status === 'keep' && n.exp.status === 'keep',
-					inferred: e.type === 'inferred',
-				};
+		if (lineageEdges.length > 0) {
+			return lineageEdges
+				.filter(e => nodeById.has(e.from) && nodeById.has(e.to))
+				.map(e => {
+					const p = nodeById.get(e.from)!;
+					const n = nodeById.get(e.to)!;
+					const dx = n.x - p.x;
+					const dy = n.y - p.y;
+					return {
+						fromId: p.id,
+						toId: n.id,
+						path: `M${p.x},${p.y} C${p.x + dx * 0.4},${p.y + dy * 0.1} ${n.x - dx * 0.4},${n.y - dy * 0.1} ${n.x},${n.y}`,
+						kept: p.exp.status === 'keep' && n.exp.status === 'keep',
+						inferred: e.type === 'inferred',
+					};
+				});
+		}
+		// Fallback: infer edges from parent_commit
+		const nodeByCommit = new Map<string, GNode>();
+		for (const n of graphNodes) nodeByCommit.set(n.exp.commit, n);
+		const edges: GEdge[] = [];
+		for (const n of graphNodes) {
+			if (!n.exp.parent_commit) continue;
+			const p = nodeByCommit.get(n.exp.parent_commit);
+			if (!p || p.id === n.id) continue;
+			const dx = n.x - p.x;
+			edges.push({
+				fromId: p.id,
+				toId: n.id,
+				path: `M${p.x},${p.y} C${p.x + dx * 0.5},${p.y} ${n.x - dx * 0.5},${n.y} ${n.x},${n.y}`,
+				kept: n.exp.status === 'keep',
+				inferred: false,
 			});
+		}
+		return edges;
 	});
 
 	// Lineage set for highlighting — walk lineageEdges bidirectionally
@@ -359,7 +395,7 @@
 						font-size={node.exp.status === 'keep' ? '14' : '11'}
 						font-weight="700"
 					>
-						{shortLabel(node.exp.id)}
+						{shortLabel(node.exp.experiment_id)}
 					</text>
 					<text
 						y={node.r + 16}
@@ -387,7 +423,7 @@
 	{#if tooltipNode && hoveredId !== selectedId}
 		<div class="tooltip" style="left: {tooltipX}px; top: {tooltipY - tooltipNode.r * sc - 12}px;">
 			<div class="tt-header">
-				<span class="tt-iter">{tooltipNode.exp.id}</span>
+				<span class="tt-iter">{tooltipNode.exp.experiment_id}</span>
 				<span class="tt-badge {tooltipNode.exp.status}">{tooltipNode.exp.status}</span>
 			</div>
 			<div class="tt-commit">{tooltipNode.exp.commit.slice(0, 7)}</div>

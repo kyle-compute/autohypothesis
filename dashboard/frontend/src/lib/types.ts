@@ -1,5 +1,6 @@
 export interface Experiment {
-	id: string;
+	id: number;
+	experiment_id: string;
 	commit: string;
 	parent_commit: string;
 	timestamp: string;
@@ -43,7 +44,7 @@ export interface Experiment {
 	hypothesis_id: string;
 	rationale: string;
 	outcome: string;
-	notes: string;
+	notes: string | Record<string, unknown>;
 
 	model_dim: number;
 	n_heads: number;
@@ -56,6 +57,24 @@ export interface Experiment {
 	weight_decay: number;
 	warmdown_ratio: number;
 	adam_betas: number[];
+
+	hyperparameters: Record<string, string | number | number[]>;
+}
+
+export interface KarpathyComparison {
+	experiment: string;
+	karpathy_bpb: number;
+	our_bpb: number;
+	delta: string;
+}
+
+export interface KarpathyOriginal {
+	commit: string;
+	val_bpb: number;
+	memory_gb: number;
+	status: string;
+	description: string;
+	best_so_far: number;
 }
 
 export const HYPERPARAM_KEYS = [

@@ -29,3 +29,4 @@ run.log
 dashboard/frontend/node_modules/
 dashboard/frontend/build/
 dashboard/frontend/.svelte-kit/
+paper_draft.md

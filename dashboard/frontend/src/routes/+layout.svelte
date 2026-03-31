@@ -19,9 +19,16 @@
 			</a>
 			<a href="/history" class="nav-link">
 				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-					<circle cx="3" cy="12" r="2"/><circle cx="8" cy="4" r="2"/><circle cx="13" cy="10" r="2"/><line x1="5" y1="10.5" x2="6.5" y2="5.5"/><line x1="9.5" y1="5.5" x2="11.5" y2="8.5"/>
+					<circle cx="8" cy="8" r="6.5"/><polyline points="8 4.5 8 8 11 9.5"/>
 				</svg>
-				Decisions
+				History
+			</a>
+			<a href="/tree" class="nav-link">
+				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="8" cy="3" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/>
+					<line x1="8" y1="5" x2="4" y2="10"/><line x1="8" y1="5" x2="12" y2="10"/>
+				</svg>
+				Tree
 			</a>
 		</div>
 	</div>
