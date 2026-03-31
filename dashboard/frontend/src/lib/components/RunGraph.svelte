@@ -215,7 +215,7 @@
 	let didFit = false;
 	$effect(() => {
 		if (graphNodes.length > 0 && width > 0 && height > 0 && !didFit) {
-			fitToView();
+			fitToView(1.5);
 			didFit = true;
 		}
 	});
@@ -255,7 +255,7 @@
 		smoothPanTo(width / 2 - node.x * sc, height / 2 - node.y * sc);
 	});
 
-	function fitToView() {
+	function fitToView(zoom: number = 1) {
 		if (graphNodes.length === 0) return;
 		const xs = graphNodes.map(n => n.x);
 		const ys = graphNodes.map(n => n.y);
@@ -266,9 +266,11 @@
 		const maxY = Math.max(...ys) + pad;
 		const cw = maxX - minX;
 		const ch = maxY - minY;
-		sc = Math.min(width / cw, height / ch, 2);
-		tx = (width - cw * sc) / 2 - minX * sc;
-		ty = (height - ch * sc) / 2 - minY * sc;
+		sc = Math.min(width / cw, height / ch, 2) * zoom;
+		const cx = (minX + maxX) / 2;
+		const cy = (minY + maxY) / 2;
+		tx = width / 2 - cx * sc;
+		ty = height / 2 - cy * sc;
 	}
 
 	// --- Interaction handlers ---
@@ -454,9 +456,9 @@
 	<!-- Watermark -->
 	<div class="watermark">
 		<svg class="x-logo" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
-		<span>@kylecompute</span>
-		<span>@patrikkml</span>
-		<span>@yimothysu</span>
+		<a href="https://x.com/kylecompute" target="_blank" rel="noopener">@kylecompute</a>
+		<a href="https://x.com/patrikkml" target="_blank" rel="noopener">@patrikkml</a>
+		<a href="https://x.com/yimothysu" target="_blank" rel="noopener">@yimothysu</a>
 	</div>
 
 </div>
@@ -525,11 +527,15 @@
 	/* Watermark */
 	.watermark {
 		position: absolute; top: 12px; left: 12px; z-index: 10;
-		display: flex; align-items: center; gap: 0.6rem;
+		display: flex; align-items: center; gap: 0.35rem;
 		font-family: var(--font-mono); font-size: 0.72rem; font-weight: 500;
 		color: var(--text-dim); opacity: 0.6;
-		pointer-events: none; user-select: none;
 	}
+	.watermark a {
+		color: var(--text-dim); text-decoration: none; transition: color 0.15s ease;
+		pointer-events: auto;
+	}
+	.watermark a:hover { color: var(--text); opacity: 1; }
 	.x-logo { flex-shrink: 0; }
 
 </style>

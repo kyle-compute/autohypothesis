@@ -1,133 +1,278 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { Experiment } from '$lib/types';
-	import { fetchExperiments } from '$lib/api';
+	import type { Experiment, ParamChange, Plateau, PlateauChild } from '$lib/types';
+	import { HYPERPARAM_KEYS } from '$lib/types';
+	import { fetchExperiments, fetchRunDetail, fetchLineage, fetchConfigDiff } from '$lib/api';
+	import type { LineageEdge, ConfigDiff } from '$lib/api';
 	import RunGraph from '$lib/components/RunGraph.svelte';
+	import InsightSidebar from '$lib/components/InsightSidebar.svelte';
+	import DiffViewer from '$lib/components/DiffViewer.svelte';
 
 	let experiments: Experiment[] = $state([]);
+	let lineageEdges: LineageEdge[] = $state([]);
 	let selectedExp: Experiment | null = $state(null);
-	let showPanel = $state(false);
-
-	function isKarpathyRun(e: Experiment): boolean { return e.experiment_id.startsWith('karpathy-'); }
-	let treeExperiments = $derived(experiments.filter(e => !isKarpathyRun(e)));
+	let showInsights = $state(true);
 
 	onMount(async () => {
-		experiments = await fetchExperiments();
+		const [exps, edges] = await Promise.all([fetchExperiments(), fetchLineage()]);
+		experiments = exps;
+		lineageEdges = edges;
 	});
 
-	function onSelectNode(exp: Experiment | null) {
-		selectedExp = exp;
-		showPanel = exp != null;
-	}
+	let treeExperiments = $derived(experiments);
 
-	function closePanel() {
-		showPanel = false;
-		selectedExp = null;
-	}
-
-	let parentExp = $derived.by((): Experiment | null => {
-		if (!selectedExp?.parent_commit) return null;
-		return experiments.find(e => e.commit === selectedExp!.parent_commit) ?? null;
-	});
-
-	function formatNotes(notes: string | Record<string, unknown>): string {
-		if (typeof notes === 'string') return notes;
-		if (notes && typeof notes === 'object') {
-			const summary = (notes as any).summary || (notes as any).notes;
-			if (typeof summary === 'string') return summary;
-			return JSON.stringify(notes, null, 2);
+	// Build plateaus for insight sidebar
+	function paramDiff(child: Experiment, parent: Experiment): ParamChange[] {
+		const changes: ParamChange[] = [];
+		for (const key of HYPERPARAM_KEYS) {
+			const cv = child[key]; const pv = parent[key];
+			if (cv != null && pv != null && String(cv) !== String(pv))
+				changes.push({ key, from: pv as string | number, to: cv as string | number });
 		}
-		return '';
+		return changes;
 	}
 
-	function deltaClass(d: number): string { return d < -0.001 ? 'good' : d > 0.001 ? 'bad' : 'neutral'; }
+	let plateaus = $derived.by((): Plateau[] => {
+		const kept = experiments.filter(e => e.status === 'keep').sort((a, b) => String(a.id).localeCompare(String(b.id)));
+		return kept.map(parent => {
+			const children: PlateauChild[] = experiments
+				.filter(e => e.parent_commit === parent.commit && e.id !== parent.id)
+				.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+				.map(exp => ({ exp, paramChanges: paramDiff(exp, parent) }));
+			return { parent, children };
+		});
+	});
+
+	let runDetail: Record<string, any> | null = $state(null);
+	let configDiff: ConfigDiff | null = $state(null);
+	const runDetailCache = new Map<string, Record<string, any>>();
+	const configDiffCache = new Map<string, ConfigDiff>();
+
+	function onSelectExp(exp: Experiment | null) {
+		selectedExp = exp;
+		if (!exp) {
+			runDetail = null;
+			configDiff = null;
+			return;
+		}
+		const eid = exp.experiment_id;
+		const cachedDetail = runDetailCache.get(eid);
+		if (cachedDetail) {
+			runDetail = cachedDetail;
+		} else {
+			fetchRunDetail(eid).then(d => {
+				if (d) runDetailCache.set(eid, d);
+				if (selectedExp?.experiment_id === eid) runDetail = d;
+			});
+		}
+		const cachedDiff = configDiffCache.get(eid);
+		if (cachedDiff) {
+			configDiff = cachedDiff;
+		} else {
+			configDiff = null;
+			fetchConfigDiff(eid).then(d => {
+				if (d) configDiffCache.set(eid, d);
+				if (selectedExp?.experiment_id === eid) configDiff = d;
+			});
+		}
+	}
+
+	let runConfig = $derived.by(() => {
+		if (!runDetail) return null;
+		const config = runDetail.config?.hyperparameters ?? runDetail.result?.changes_from_baseline ?? null;
+		return config;
+	});
+
+	let selectedParent = $derived(
+		selectedExp?.parent_commit
+			? experiments.find(e => e.commit === selectedExp!.parent_commit) ?? null
+			: null
+	);
+
+	let selectedParams = $derived.by((): ParamChange[] => {
+		if (!selectedExp || !selectedParent) return [];
+		return paramDiff(selectedExp, selectedParent);
+	});
+
+	function fmtParam(key: string, val: string | number): string {
+		if (typeof val === 'number') {
+			if (key.endsWith('_lr')) return val.toPrecision(3);
+			if (key.endsWith('_ratio')) return val.toFixed(2);
+			return String(val);
+		}
+		return String(val);
+	}
+
+	// Keep traversal
+	let keepExps = $derived(
+		experiments.filter(e => e.status === 'keep').sort((a, b) => String(a.id).localeCompare(String(b.id)))
+	);
+
+	let keepIdx = $derived(
+		selectedExp ? keepExps.findIndex(e => e.id === selectedExp!.id) : -1
+	);
+
+	function goKeep(dir: -1 | 1) {
+		if (keepExps.length === 0) return;
+		let idx = keepIdx;
+		if (idx === -1) {
+			idx = dir === 1 ? 0 : keepExps.length - 1;
+		} else {
+			idx += dir;
+			if (idx < 0) idx = keepExps.length - 1;
+			if (idx >= keepExps.length) idx = 0;
+		}
+		onSelectExp(keepExps[idx]);
+	}
 </script>
 
-<div class="tree-page">
-	<div class="tree-graph" class:panel-open={showPanel}>
-		<RunGraph experiments={treeExperiments} onSelect={onSelectNode} focusId={selectedExp?.experiment_id ?? null} />
+<div class="tree-view">
+	<div class="graph-area">
+		<RunGraph experiments={treeExperiments} {lineageEdges} onSelect={onSelectExp} focusId={selectedExp?.experiment_id ?? null} />
 	</div>
 
-	{#if showPanel && selectedExp}
-		{@const exp = selectedExp}
-		{@const notesText = formatNotes(exp.notes)}
-		<div class="panel">
-			<!-- Header -->
-			<div class="p-header">
-				<div class="p-title">
-					<span class="p-badge {exp.status}">{exp.status}</span>
-					<h2>#{exp.id} {exp.experiment_id.replace(/^exp-\d+-/, '')}</h2>
+	<!-- Floating Insight Sidebar -->
+	<div class="insight-float" class:collapsed={!showInsights}>
+		<button class="insight-toggle" onclick={() => (showInsights = !showInsights)}>
+			{showInsights ? '\u2715' : '\u2139'}
+		</button>
+		{#if showInsights}
+			<div class="insight-body">
+				<InsightSidebar {experiments} {plateaus} />
+			</div>
+		{/if}
+	</div>
+
+	<!-- Selected Experiment Detail Card -->
+	{#if selectedExp}
+		<div class="detail-card">
+			<!-- Fixed header -->
+			<div class="dc-header">
+				<div class="dc-header-left">
+					<span class="dc-badge {selectedExp.status}">{selectedExp.status}</span>
+					<span class="dc-iter" title={selectedExp.experiment_id}>{selectedExp.experiment_id}</span>
+					<span class="dc-commit">{selectedExp.commit.slice(0, 7)}</span>
 				</div>
-				<button class="p-close" onclick={closePanel}>&times;</button>
+				<button class="dc-close" onclick={() => onSelectExp(null)}>&times;</button>
 			</div>
 
-			<div class="p-scroll">
-				<!-- BPB result -->
-				<div class="p-result">
-					<span class="p-bpb">{exp.val_bpb.toFixed(6)}</span>
-					<span class="p-bpb-label">val_bpb</span>
-					{#if exp.delta !== 0}
-						<span class="p-delta {deltaClass(exp.delta)}">{exp.delta > 0 ? '+' : ''}{exp.delta.toFixed(6)}</span>
+			<!-- Scrollable body -->
+			<div class="dc-scroll">
+				<!-- Result -->
+				<div class="dc-result">
+					<span class="dc-bpb-val">{selectedExp.val_bpb.toFixed(6)}</span>
+					{#if selectedExp.delta !== 0}
+						<span class="dc-delta" class:good={selectedExp.delta < 0} class:bad={selectedExp.delta > 0}>
+							{selectedExp.delta >= 0 ? '+' : ''}{selectedExp.delta.toFixed(6)}
+						</span>
 					{/if}
 				</div>
 
-				<!-- Parent info -->
-				{#if parentExp}
-					<div class="p-sec p-parent">
-						<h3>Based on</h3>
-						<div class="p-parent-card">
-							<span class="p-parent-badge {parentExp.status}">{parentExp.status}</span>
-							<span class="p-parent-name">#{parentExp.id} {parentExp.experiment_id.replace(/^exp-\d+-/, '')}</span>
-							<span class="p-parent-bpb">{parentExp.val_bpb.toFixed(4)}</span>
-						</div>
-					</div>
+				<!-- Description -->
+				{#if selectedExp.description}
+					<div class="dc-desc">{selectedExp.description}</div>
 				{/if}
 
 				<!-- Hypothesis -->
-				{#if exp.rationale}
-					<div class="p-sec">
-						<h3>Hypothesis</h3>
-						{#if exp.hypothesis_id}<span class="p-htag">{exp.hypothesis_id}</span>{/if}
-						<p class="p-text">{exp.rationale}</p>
-					</div>
-				{/if}
-
-				<!-- Decision write-up (the "diff" of decisions) -->
-				{#if exp.decision_markdown}
-					<div class="p-sec">
-						<h3>Decision</h3>
-						<div class="p-markdown">
-							{#each exp.decision_markdown.split('\n') as line}
-								{#if line.startsWith('# ')}<h4>{line.slice(2)}</h4>
-								{:else if line.startsWith('## ')}<h5>{line.slice(3)}</h5>
-								{:else if line.startsWith('- ')}<p class="md-li">{@html line.slice(2).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')}</p>
-								{:else if line.trim()}<p>{@html line.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')}</p>
-								{/if}
-							{/each}
+				{#if runDetail?.plan?.hypothesis && (runDetail.plan.hypothesis.rationale || runDetail.plan.hypothesis.prediction)}
+					{@const hyp = runDetail.plan.hypothesis}
+					<details class="dc-expand">
+						<summary>Hypothesis</summary>
+						<div class="dc-expand-body">
+							{#if hyp.rationale}<div class="dc-hyp-text">{hyp.rationale}</div>{/if}
+							{#if hyp.prediction}<div class="dc-hyp-pred">{hyp.prediction}</div>{/if}
 						</div>
-					</div>
+					</details>
 				{/if}
 
-				<!-- Analysis / Notes -->
-				{#if notesText}
-					<div class="p-sec">
-						<h3>Analysis</h3>
-						<p class="p-text">{notesText}</p>
+				<!-- Param changes -->
+				{#if selectedParams.length > 0}
+					<div class="dc-pills">
+						{#each selectedParams as ch}
+							<span class="dc-pill">
+								<span class="pill-k">{ch.key}</span>
+								<span class="pill-from">{fmtParam(ch.key, ch.from)}</span>
+								<span class="pill-arr">&rarr;</span>
+								<span class="pill-to">{fmtParam(ch.key, ch.to)}</span>
+							</span>
+						{/each}
 					</div>
 				{/if}
 
 				<!-- Metrics -->
-				{#if exp.num_steps}
-					<div class="p-sec">
-						<h3>Metrics</h3>
-						<div class="p-metrics">
-							<span>{exp.num_steps.toLocaleString()} steps</span>
-							{#if exp.training_seconds}<span>{Math.floor(exp.training_seconds / 60)}m {Math.round(exp.training_seconds % 60)}s train</span>{/if}
-							{#if exp.peak_vram_gb}<span>{exp.peak_vram_gb.toFixed(1)}GB VRAM</span>{/if}
-							{#if exp.num_params_M}<span>{exp.num_params_M.toFixed(1)}M params</span>{/if}
-							{#if exp.mfu_percent}<span>{exp.mfu_percent.toFixed(1)}% MFU</span>{/if}
+				<div class="dc-metrics">
+					{#if selectedExp.num_steps > 0}<span>{selectedExp.num_steps} steps</span>{/if}
+					{#if selectedExp.peak_vram_gb}<span>{selectedExp.peak_vram_gb.toFixed(1)}GB VRAM</span>{/if}
+					{#if selectedExp.tokens_per_second != null}<span>{selectedExp.tokens_per_second.toLocaleString()} tok/s</span>{/if}
+					{#if selectedExp.mfu_percent > 0}<span>{selectedExp.mfu_percent.toFixed(1)}% MFU</span>{/if}
+				</div>
+
+				<!-- Config Diff -->
+				{#if configDiff?.has_diff && configDiff.changes?.filter(ch => ch.old != null && ch.new != null).length}
+					<details class="dc-expand">
+						<summary>Config diff vs {configDiff.parent_id}</summary>
+						<div class="dc-expand-body">
+							<div class="dc-cdiff">
+								{#each configDiff.changes.filter(ch => ch.old != null && ch.new != null) as ch}
+									<div class="dc-cdiff-row">
+										<span class="dc-cdiff-key">{ch.key}</span>
+										<span class="dc-cdiff-old">{ch.old}</span>
+										<span class="dc-cdiff-arr">&rarr;</span>
+										<span class="dc-cdiff-new">{ch.new}</span>
+									</div>
+								{/each}
+							</div>
 						</div>
-					</div>
+					</details>
+				{/if}
+
+				<!-- Expandable: Config -->
+				{#if runConfig}
+					<details class="dc-expand">
+						<summary>Config</summary>
+						<div class="dc-expand-body">
+							<div class="dc-config-grid">
+								{#each Object.entries(runConfig).filter(([k]) => k !== 'base_experiment') as [key, val]}
+									<div class="dc-cfg-row">
+										<span class="dc-cfg-key">{key}</span>
+										<span class="dc-cfg-val">{typeof val === 'object' ? JSON.stringify(val) : val}</span>
+									</div>
+								{/each}
+							</div>
+							{#if runConfig.base_experiment}
+								<div class="dc-cfg-base">Base: {runConfig.base_experiment}</div>
+							{/if}
+						</div>
+					</details>
+				{/if}
+
+				<!-- Expandable: Diff -->
+				{#if selectedExp.diff_text}
+					<details class="dc-expand">
+						<summary>Diff</summary>
+						<div class="dc-expand-body dc-diff"><DiffViewer diff={selectedExp.diff_text} /></div>
+					</details>
+				{/if}
+			</div>
+
+			<!-- Fixed footer nav -->
+			<div class="dc-nav">
+				{#if keepIdx > 0}
+					<button class="dc-nav-btn" onclick={() => goKeep(-1)}>
+						<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3L4.5 7l4 4"/></svg>
+						Prev
+					</button>
+				{:else}
+					<span></span>
+				{/if}
+				<span class="dc-nav-pos">{keepIdx >= 0 ? keepIdx + 1 : '-'} / {keepExps.length}</span>
+				{#if keepIdx >= 0 && keepIdx < keepExps.length - 1}
+					<button class="dc-nav-btn" onclick={() => goKeep(1)}>
+						Next
+						<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 3l4 4-4 4"/></svg>
+					</button>
+				{:else}
+					<span></span>
 				{/if}
 			</div>
 		</div>
@@ -135,133 +280,146 @@
 </div>
 
 <style>
-	.tree-page {
-		display: flex;
-		height: calc(100vh - 56px);
-		overflow: hidden;
-		width: 100vw;
-		margin-left: calc(-50vw + 50%);
-		margin-top: -1.5rem;
+	.tree-view { position: relative; height: calc(100vh - 56px - 3rem); min-height: 500px; }
+	.graph-area { width: 100%; height: 100%; }
+
+	/* Insight panel */
+	.insight-float { position: absolute; top: 12px; right: 12px; z-index: 20; }
+	.insight-float.collapsed { background: transparent; }
+	.insight-float:not(.collapsed) { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-lg); width: 260px; }
+	.insight-toggle {
+		position: absolute; top: 0; right: 0; width: 32px; height: 32px;
+		background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+		display: flex; align-items: center; justify-content: center;
+		cursor: pointer; color: var(--text-dim); font-size: 0.85rem; z-index: 1;
+		box-shadow: var(--shadow-sm); transition: all 0.15s ease;
 	}
-	.tree-graph {
-		flex: 1;
-		min-width: 0;
-		transition: flex 0.2s ease;
-	}
-	.tree-graph.panel-open {
-		flex: 0 0 55%;
+	.insight-float:not(.collapsed) .insight-toggle { top: 8px; right: 8px; border: none; box-shadow: none; background: none; }
+	.insight-toggle:hover { color: var(--text); }
+	.insight-body { padding: 1rem 1.1rem; max-height: calc(100vh - 56px - 6rem); overflow-y: auto; }
+
+	/* Detail card */
+	.detail-card {
+		position: absolute; bottom: 12px; left: 12px; z-index: 20;
+		background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+		box-shadow: var(--shadow-lg); width: 360px;
+		max-height: calc(100vh - 56px - 4rem);
+		display: flex; flex-direction: column;
 	}
 
-	/* Slide-out panel */
-	.panel {
-		flex: 0 0 45%;
-		border-left: 1px solid var(--border);
-		background: var(--bg-card);
-		display: flex;
-		flex-direction: column;
-		overflow: hidden;
-	}
-	.p-header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
+	/* Fixed header */
+	.dc-header {
+		display: flex; justify-content: space-between; align-items: center;
 		padding: 0.75rem 1rem;
 		border-bottom: 1px solid var(--border);
 		flex-shrink: 0;
 	}
-	.p-title {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
+	.dc-header-left { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+	.dc-badge {
+		font-size: 0.58rem; font-weight: 700; text-transform: uppercase;
+		letter-spacing: 0.05em; padding: 0.15rem 0.45rem; border-radius: 4px; flex-shrink: 0;
 	}
-	.p-title h2 {
-		font-family: var(--font-mono);
-		font-size: 0.9rem;
-		font-weight: 600;
-		color: var(--text);
+	.dc-badge.keep { background: var(--green-bg); color: var(--green); }
+	.dc-badge.discard { background: var(--red-bg); color: var(--red); }
+	.dc-badge.crash { background: var(--amber-bg); color: var(--amber); }
+	.dc-badge.replicate { background: var(--blue-bg); color: var(--blue); }
+	.dc-iter {
+		font-family: var(--font-mono); font-weight: 700; font-size: 0.82rem; color: var(--text);
+		overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 	}
-	.p-badge {
-		font-size: 0.55rem; font-weight: 600; text-transform: uppercase;
-		letter-spacing: 0.04em; padding: 0.15rem 0.4rem; border-radius: 999px;
-	}
-	.p-badge.keep { background: var(--green-bg); color: var(--green); }
-	.p-badge.discard { background: var(--red-bg); color: var(--red); }
-	.p-badge.crash { background: var(--amber-bg); color: var(--amber); }
-	.p-close {
-		background: none; border: 1px solid var(--border); color: var(--text-dim);
-		font-size: 1.1rem; cursor: pointer; width: 28px; height: 28px;
+	.dc-commit { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-dim); flex-shrink: 0; }
+	.dc-close {
+		background: none; border: none; color: var(--text-dim);
+		font-size: 1.1rem; cursor: pointer; width: 24px; height: 24px;
 		display: flex; align-items: center; justify-content: center;
-		border-radius: var(--radius-sm); transition: all 0.15s ease;
+		border-radius: var(--radius-sm); line-height: 1; transition: all 0.15s ease; flex-shrink: 0;
 	}
-	.p-close:hover { color: var(--text); background: var(--bg-hover); }
+	.dc-close:hover { color: var(--text); background: var(--bg-hover); }
 
-	.p-scroll {
-		flex: 1;
-		overflow-y: auto;
-		padding: 0;
-	}
+	/* Scrollable body */
+	.dc-scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 0.75rem 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
 
-	/* Result */
-	.p-result {
-		display: flex; align-items: baseline; gap: 0.4rem;
-		padding: 0.75rem 1rem;
-		background: var(--bg-subtle);
-		border-bottom: 1px solid var(--border);
-	}
-	.p-bpb { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 700; color: var(--text); }
-	.p-bpb-label { font-size: 0.65rem; color: var(--text-dim); text-transform: uppercase; }
-	.p-delta { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600; }
-	.p-delta.good { color: var(--green); }
-	.p-delta.bad { color: var(--red); }
-	.p-delta.neutral { color: var(--text-dim); }
+	/* Result row */
+	.dc-result { display: flex; align-items: baseline; gap: 0.35rem; }
+	.dc-bpb-val { font-family: var(--font-mono); font-size: 1.4rem; font-weight: 700; color: var(--text); }
+	.dc-delta { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 600; }
+	.dc-delta.good { color: var(--green); }
+	.dc-delta.bad { color: var(--red); opacity: 0.7; }
 
-	/* Parent */
-	.p-parent-card {
-		display: flex; align-items: center; gap: 0.4rem;
-		padding: 0.4rem 0.6rem; background: var(--bg-hover);
-		border-radius: var(--radius-sm); border: 1px solid var(--border);
-		margin-top: 0.3rem;
-	}
-	.p-parent-badge {
-		font-size: 0.5rem; font-weight: 600; text-transform: uppercase;
-		padding: 0.1rem 0.3rem; border-radius: 999px;
-	}
-	.p-parent-badge.keep { background: var(--green-bg); color: var(--green); }
-	.p-parent-badge.discard { background: var(--red-bg); color: var(--red); }
-	.p-parent-name { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 600; color: var(--text); }
-	.p-parent-bpb { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-dim); margin-left: auto; }
+	/* Description */
+	.dc-desc { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.4; }
 
-	/* Sections */
-	.p-sec {
-		padding: 0.75rem 1rem;
-		border-bottom: 1px solid var(--border);
-	}
-	.p-sec:last-child { border-bottom: none; }
-	.p-sec h3 {
-		font-size: 0.6rem; color: var(--text-dim); text-transform: uppercase;
-		letter-spacing: 0.08em; font-weight: 600; margin-bottom: 0.35rem;
-	}
-	.p-htag {
-		display: inline-block; font-family: var(--font-mono); font-size: 0.62rem;
-		background: var(--accent-light); color: var(--accent);
-		padding: 0.1rem 0.4rem; border-radius: 999px; margin-bottom: 0.3rem;
-	}
-	.p-text {
-		font-size: 0.8rem; color: var(--text-secondary); line-height: 1.55;
-	}
+	/* Hypothesis */
+	.dc-hyp-text { font-size: 0.72rem; color: var(--text-secondary); line-height: 1.45; }
+	.dc-hyp-pred { font-size: 0.68rem; color: var(--text-dim); font-style: italic; margin-top: 0.3rem; }
 
-	/* Markdown */
-	.p-markdown { font-size: 0.78rem; color: var(--text-secondary); line-height: 1.55; }
-	.p-markdown h4 { font-size: 0.85rem; font-weight: 700; color: var(--text); margin: 0.5rem 0 0.25rem; }
-	.p-markdown h5 { font-size: 0.75rem; font-weight: 600; color: var(--text); margin: 0.4rem 0 0.2rem; text-transform: uppercase; letter-spacing: 0.04em; }
-	.p-markdown p { margin: 0.15rem 0; }
-	.p-markdown :global(strong) { color: var(--text); }
-	.p-markdown .md-li { padding-left: 0.8rem; }
-	.p-markdown .md-li::before { content: '•'; display: inline-block; margin-left: -0.6rem; margin-right: 0.3rem; color: var(--text-dim); }
+	/* Param change pills */
+	.dc-pills { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+	.dc-pill {
+		display: inline-flex; align-items: center; gap: 0.2rem;
+		padding: 0.12rem 0.45rem; background: var(--bg-subtle); border: 1px solid var(--border);
+		border-radius: 999px; font-size: 0.65rem; font-family: var(--font-mono);
+	}
+	.pill-k { color: var(--text-dim); font-weight: 500; }
+	.pill-from { color: var(--red); opacity: 0.7; }
+	.pill-arr { color: var(--text-dim); font-size: 0.55rem; }
+	.pill-to { color: var(--accent); font-weight: 600; }
 
 	/* Metrics */
-	.p-metrics {
-		display: flex; flex-wrap: wrap; gap: 0.5rem;
-		font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-secondary);
+	.dc-metrics {
+		display: flex; flex-wrap: wrap; gap: 0.4rem;
+		font-size: 0.7rem; color: var(--text-dim); font-family: var(--font-mono);
 	}
+	.dc-metrics span {
+		padding: 0.1rem 0.4rem; background: var(--bg-hover); border-radius: 4px;
+	}
+
+	/* Expandable sections */
+	.dc-expand summary {
+		font-size: 0.68rem; font-weight: 600; color: var(--text-dim);
+		cursor: pointer; padding: 0.2rem 0; text-transform: uppercase; letter-spacing: 0.06em;
+		list-style: none;
+		display: flex; align-items: center; gap: 0.3rem;
+	}
+	.dc-expand summary::-webkit-details-marker { display: none; }
+	.dc-expand summary::before {
+		content: '\203A'; font-size: 0.85rem; line-height: 1; transition: transform 0.15s ease;
+		display: inline-block; color: var(--text-dim);
+	}
+	.dc-expand[open] summary::before { transform: rotate(90deg); }
+	.dc-expand summary:hover { color: var(--text); }
+	.dc-expand summary:hover::before { color: var(--text); }
+	.dc-expand-body { margin-top: 0.3rem; }
+	.dc-diff { max-height: 260px; overflow-y: auto; }
+
+	/* Config diff */
+	.dc-cdiff { display: flex; flex-direction: column; gap: 0.15rem; }
+	.dc-cdiff-row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 0.3rem; align-items: center; padding: 0.12rem 0; }
+	.dc-cdiff-key { font-size: 0.65rem; color: var(--text-dim); font-family: var(--font-mono); }
+	.dc-cdiff-old { font-size: 0.65rem; color: var(--red); font-family: var(--font-mono); opacity: 0.7; text-align: right; max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.dc-cdiff-arr { font-size: 0.55rem; color: var(--text-dim); }
+	.dc-cdiff-new { font-size: 0.65rem; color: var(--green); font-family: var(--font-mono); font-weight: 600; max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+	/* Config grid */
+	.dc-config-grid { display: flex; flex-direction: column; gap: 0.1rem; }
+	.dc-cfg-row { display: flex; justify-content: space-between; gap: 0.5rem; padding: 0.08rem 0; }
+	.dc-cfg-key { font-size: 0.65rem; color: var(--text-dim); font-family: var(--font-mono); white-space: nowrap; }
+	.dc-cfg-val { font-size: 0.65rem; color: var(--text); font-family: var(--font-mono); font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+	.dc-cfg-base { font-size: 0.62rem; color: var(--text-dim); font-style: italic; margin-top: 0.3rem; }
+
+	/* Fixed footer nav */
+	.dc-nav {
+		display: flex; align-items: center; justify-content: space-between;
+		padding: 0.5rem 1rem;
+		border-top: 1px solid var(--border);
+		flex-shrink: 0;
+	}
+	.dc-nav-btn {
+		display: flex; align-items: center; gap: 0.3rem;
+		background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+		padding: 0.25rem 0.5rem; font-size: 0.7rem; font-weight: 500;
+		color: var(--text-secondary); cursor: pointer; transition: all 0.15s ease;
+	}
+	.dc-nav-btn:hover { color: var(--text); background: var(--bg-hover); border-color: var(--border-strong); }
+	.dc-nav-pos { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); }
 </style>
