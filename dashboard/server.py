@@ -1,952 +1,39 @@
-from __future__ import annotations
+"""
+Dashboard server. Reads experiments.jsonl, serves API + SSE + static files.
+Harness-agnostic: any tool that writes ExperimentRecord JSON lines works.
+"""
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from sse_starlette.sse import EventSourceResponse
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).parent.parent
 EXPERIMENTS_FILE = REPO_ROOT / "experiments.jsonl"
 
 app = FastAPI(title="autoresearch dashboard")
 
+# In-memory cache
+_records: list[dict] = []
+_subscribers: list[asyncio.Queue] = []
 
-BASE_CSS = """
-:root {
-  color-scheme: dark;
-  --bg: #0b1020;
-  --panel: rgba(13, 20, 38, 0.92);
-  --panel-2: rgba(17, 27, 50, 0.92);
-  --border: rgba(148, 163, 184, 0.18);
-  --text: #e5edf7;
-  --muted: #93a4bc;
-  --green: #22c55e;
-  --green-bg: rgba(34, 197, 94, 0.14);
-  --red: #f87171;
-  --red-bg: rgba(248, 113, 113, 0.14);
-  --amber: #f59e0b;
-  --amber-bg: rgba(245, 158, 11, 0.14);
-  --blue: #60a5fa;
-  --blue-bg: rgba(96, 165, 250, 0.14);
-  --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
-  --radius: 18px;
-  --radius-sm: 12px;
-  --mono: "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
-  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
 
-* { box-sizing: border-box; }
-html, body { margin: 0; min-height: 100%; background:
-  radial-gradient(circle at top left, rgba(96, 165, 250, 0.18), transparent 28%),
-  radial-gradient(circle at top right, rgba(34, 197, 94, 0.12), transparent 24%),
-  linear-gradient(180deg, #0b1020 0%, #0c1224 100%);
-  color: var(--text);
-  font-family: var(--sans);
-}
-a { color: inherit; }
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-.shell {
-  max-width: 1500px;
-  margin: 0 auto;
-  padding: 24px;
-}
-
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: center;
-  margin-bottom: 20px;
-}
-
-.brand {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.eyebrow {
-  color: var(--muted);
-  font-size: 12px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.title {
-  font-size: 28px;
-  font-weight: 700;
-}
-
-.subtitle {
-  color: var(--muted);
-  max-width: 760px;
-  line-height: 1.5;
-}
-
-.nav {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.nav a {
-  text-decoration: none;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  padding: 10px 14px;
-  border-radius: 999px;
-}
-
-.nav a.active {
-  background: var(--panel-2);
-  border-color: rgba(96, 165, 250, 0.42);
-  color: #dbeafe;
-}
-
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(18px);
-}
-
-.stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 14px;
-  margin-bottom: 18px;
-}
-
-.stat {
-  padding: 16px 18px;
-}
-
-.stat-label {
-  color: var(--muted);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-bottom: 10px;
-}
-
-.stat-value {
-  font-size: 26px;
-  font-weight: 700;
-}
-
-.layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.9fr);
-  gap: 18px;
-}
-
-.graph-panel {
-  padding: 16px;
-  overflow: hidden;
-}
-
-.detail-panel {
-  padding: 18px;
-  min-height: 640px;
-}
-
-.section-title {
-  font-size: 16px;
-  font-weight: 700;
-  margin-bottom: 12px;
-}
-
-.graph-wrap {
-  width: 100%;
-  min-height: 640px;
-  overflow: auto;
-  border-radius: var(--radius-sm);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
-    rgba(3, 8, 20, 0.32);
-  border: 1px solid rgba(148, 163, 184, 0.08);
-}
-
-.legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 14px;
-}
-
-.legend-item {
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.legend-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-}
-
-.empty {
-  color: var(--muted);
-  padding: 40px 8px;
-}
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.badge.keep { background: var(--green-bg); color: var(--green); }
-.badge.discard { background: var(--red-bg); color: var(--red); }
-.badge.crash { background: var(--amber-bg); color: var(--amber); }
-.badge.replicate { background: var(--blue-bg); color: var(--blue); }
-
-.detail-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.detail-title h2 {
-  margin: 0;
-  font-size: 24px;
-}
-
-.detail-block {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(148, 163, 184, 0.12);
-}
-
-.kv {
-  display: grid;
-  grid-template-columns: 110px minmax(0, 1fr);
-  gap: 8px 12px;
-  align-items: start;
-  font-size: 14px;
-}
-
-.kv .k {
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 11px;
-  margin-top: 3px;
-}
-
-.mono {
-  font-family: var(--mono);
-}
-
-.pill-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.pill {
-  padding: 7px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  background: rgba(255, 255, 255, 0.04);
-  font-size: 12px;
-  font-family: var(--mono);
-}
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.metric {
-  padding: 12px;
-  border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(148, 163, 184, 0.12);
-}
-
-.metric-label {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 6px;
-}
-
-.metric-value {
-  font-size: 18px;
-  font-weight: 700;
-}
-
-.muted {
-  color: var(--muted);
-}
-
-.diff-toggle {
-  margin-top: 12px;
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  border-radius: 999px;
-  background: var(--panel-2);
-  border: 1px solid rgba(96, 165, 250, 0.3);
-  padding: 10px 14px;
-  color: #dbeafe;
-  cursor: pointer;
-}
-
-.diff {
-  margin-top: 12px;
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(0, 0, 0, 0.28);
-  overflow: auto;
-  max-height: 280px;
-  white-space: pre-wrap;
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.decision-md {
-  margin-top: 12px;
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  background: rgba(0, 0, 0, 0.2);
-  overflow: auto;
-  max-height: 340px;
-  white-space: pre-wrap;
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.link-card {
-  display: grid;
-  gap: 10px;
-  padding: 22px;
-}
-
-.link-card a {
-  text-decoration: none;
-}
-
-.hero-value {
-  font-size: 46px;
-  font-weight: 800;
-}
-
-.hero-sub {
-  color: var(--muted);
-}
-
-svg text {
-  font-family: var(--mono);
-}
-
-@media (max-width: 1100px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
-
-  .detail-panel {
-    min-height: auto;
-  }
-}
-"""
-
-
-INDEX_BODY = """
-<div class="shell">
-  <div class="topbar">
-    <div class="brand">
-      <div class="eyebrow">Autoresearch Dashboard</div>
-      <div class="title">Run Summary</div>
-      <div class="subtitle">Derived from root-level <span class="mono">experiments.jsonl</span>, which is exported by <span class="mono">uv run python orchestrator.py sync</span>.</div>
-    </div>
-    <div class="nav">
-      <a class="active" href="/">Latest</a>
-      <a href="/history">History</a>
-      <a href="/api/experiments">API</a>
-    </div>
-  </div>
-
-  <div class="stats" id="stats"></div>
-
-  <div class="layout">
-    <div class="panel link-card" id="latest-card">
-      <div class="section-title">Latest Experiment</div>
-      <div class="empty">Waiting for experiment data.</div>
-    </div>
-    <div class="panel link-card">
-      <div class="section-title">Next Step</div>
-      <div class="subtitle">Run <span class="mono">uv run python orchestrator.py sync</span> after completed experiments, then refresh <span class="mono">/history</span>.</div>
-      <a class="diff-toggle" href="/history">Open lineage graph</a>
-    </div>
-  </div>
-</div>
-"""
-
-
-INDEX_SCRIPT = """
-const fmt = (value, digits = 4) => Number.isFinite(value) ? value.toFixed(digits) : 'n/a';
-
-function badge(status) {
-  return `<span class="badge ${status}">${status}</span>`;
-}
-
-function statCard(label, value, subtitle = '') {
-  return `
-    <div class="panel stat">
-      <div class="stat-label">${label}</div>
-      <div class="stat-value">${value}</div>
-      ${subtitle ? `<div class="muted">${subtitle}</div>` : ''}
-    </div>
-  `;
-}
-
-function compareExperiments(a, b) {
-  const aOrdinal = Number.isFinite(a.ordinal) ? a.ordinal : null;
-  const bOrdinal = Number.isFinite(b.ordinal) ? b.ordinal : null;
-  if (aOrdinal != null && bOrdinal != null && aOrdinal !== bOrdinal) {
-    return aOrdinal - bOrdinal;
-  }
-  if (aOrdinal != null && bOrdinal == null) return -1;
-  if (aOrdinal == null && bOrdinal != null) return 1;
-  const aTime = a.timestamp || '';
-  const bTime = b.timestamp || '';
-  if (aTime !== bTime) {
-    return aTime.localeCompare(bTime);
-  }
-  return String(a.id || '').localeCompare(String(b.id || ''));
-}
-
-function runLabel(item) {
-  if (Number.isFinite(item.ordinal) && item.ordinal > 0) {
-    return `#${item.ordinal}`;
-  }
-  return item.id || 'n/a';
-}
-
-async function load() {
-  const res = await fetch('/api/experiments');
-  const records = res.ok ? await res.json() : [];
-  const stats = document.getElementById('stats');
-  const latestCard = document.getElementById('latest-card');
-
-  if (!records.length) {
-    stats.innerHTML = [
-      statCard('Runs', '0'),
-      statCard('Kept', '0'),
-      statCard('Best BPB', 'n/a'),
-    ].join('');
-    return;
-  }
-
-  records.sort(compareExperiments);
-  const latest = records[records.length - 1];
-  const kept = records.filter((item) => item.status === 'keep' || item.status === 'replicate');
-  const best = kept.reduce((bestSoFar, item) => {
-    if (!bestSoFar) return item;
-    return item.val_bpb < bestSoFar.val_bpb ? item : bestSoFar;
-  }, null);
-
-  stats.innerHTML = [
-    statCard('Runs', String(records.length)),
-    statCard('Kept', String(kept.length)),
-    statCard('Best BPB', best ? fmt(best.val_bpb, 6) : 'n/a', best ? best.commit : ''),
-  ].join('');
-
-  latestCard.innerHTML = `
-    <div class="section-title">Latest Experiment</div>
-    <div class="hero-value">${fmt(latest.val_bpb, 6)}</div>
-    <div class="hero-sub">val_bpb</div>
-    <div>${badge(latest.status)}</div>
-    <div class="subtitle">${latest.description || 'No description'}</div>
-    <div class="kv">
-      <div class="k">Run</div><div class="mono">${runLabel(latest)}</div>
-      <div class="k">Commit</div><div class="mono">${latest.commit || 'unknown'}</div>
-      <div class="k">Parent</div><div class="mono">${latest.parent_commit || 'root'}</div>
-      <div class="k">When</div><div>${latest.timestamp || 'n/a'}</div>
-      <div class="k">Worker</div><div>${latest.worker_id || 'n/a'}${latest.gpu_id ? ' / gpu ' + latest.gpu_id : ''}</div>
-    </div>
-    <a class="diff-toggle" href="/history">Inspect decision graph</a>
-  `;
-}
-
-load();
-"""
-
-
-HISTORY_BODY = """
-<div class="shell">
-  <div class="topbar">
-    <div class="brand">
-      <div class="eyebrow">Autoresearch Dashboard</div>
-      <div class="title">History</div>
-      <div class="subtitle">Lineage view of completed runs exported from the current orchestrator. Edges are driven by <span class="mono">parent_commit</span>, not by mutable brief state.</div>
-    </div>
-    <div class="nav">
-      <a href="/">Latest</a>
-      <a class="active" href="/history">History</a>
-      <a href="/api/experiments">API</a>
-    </div>
-  </div>
-
-  <div class="stats" id="stats"></div>
-
-  <div class="legend">
-    <div class="legend-item"><span class="legend-dot" style="background: var(--green)"></span>keep</div>
-    <div class="legend-item"><span class="legend-dot" style="background: var(--blue)"></span>replicate</div>
-    <div class="legend-item"><span class="legend-dot" style="background: var(--red)"></span>discard</div>
-    <div class="legend-item"><span class="legend-dot" style="background: var(--amber)"></span>crash</div>
-  </div>
-
-  <div class="layout">
-    <div class="panel graph-panel">
-      <div class="section-title">Lineage Graph</div>
-      <div class="graph-wrap" id="graph-wrap">
-        <div class="empty" id="graph-empty">Waiting for experiment data.</div>
-        <svg id="graph" width="100%" height="640" aria-label="experiment history graph"></svg>
-      </div>
-    </div>
-
-    <aside class="panel detail-panel">
-      <div class="section-title">Experiment Detail</div>
-      <div id="detail-empty" class="empty">Select a node to inspect lineage, hyperparameter deltas, the scientific decision note, rationale, and outcome.</div>
-      <div id="detail" hidden></div>
-    </aside>
-  </div>
-</div>
-"""
-
-
-HISTORY_SCRIPT = """
-const STATUS_COLORS = {
-  keep: '#22c55e',
-  replicate: '#60a5fa',
-  discard: '#f87171',
-  crash: '#f59e0b',
-};
-
-const PARAM_KEYS = [
-  'depth',
-  'model_dim',
-  'n_heads',
-  'head_dim',
-  'window_pattern',
-  'total_batch_size',
-  'device_batch_size',
-  'matrix_lr',
-  'embedding_lr',
-  'weight_decay',
-  'warmdown_ratio',
-];
-
-let experiments = [];
-let selectedId = null;
-let graphWidth = 1200;
-const graphHeight = 640;
-const padding = { top: 56, right: 84, bottom: 72, left: 84 };
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
-function fmt(value, digits = 4) {
-  return Number.isFinite(value) ? Number(value).toFixed(digits) : 'n/a';
-}
-
-function compareExperiments(a, b) {
-  const aOrdinal = Number.isFinite(a.ordinal) ? a.ordinal : null;
-  const bOrdinal = Number.isFinite(b.ordinal) ? b.ordinal : null;
-  if (aOrdinal != null && bOrdinal != null && aOrdinal !== bOrdinal) {
-    return aOrdinal - bOrdinal;
-  }
-  if (aOrdinal != null && bOrdinal == null) return -1;
-  if (aOrdinal == null && bOrdinal != null) return 1;
-  const aTime = a.timestamp || '';
-  const bTime = b.timestamp || '';
-  if (aTime !== bTime) {
-    return aTime.localeCompare(bTime);
-  }
-  return String(a.id || '').localeCompare(String(b.id || ''));
-}
-
-function runLabel(exp) {
-  if (Number.isFinite(exp.ordinal) && exp.ordinal > 0) {
-    return `#${exp.ordinal}`;
-  }
-  return exp.id || 'n/a';
-}
-
-function metricCard(label, value) {
-  return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div></div>`;
-}
-
-function statusBadge(status) {
-  return `<span class="badge ${status}">${escapeHtml(status)}</span>`;
-}
-
-function renderStats() {
-  const stats = document.getElementById('stats');
-  if (!experiments.length) {
-    stats.innerHTML = [
-      '<div class="panel stat"><div class="stat-label">Runs</div><div class="stat-value">0</div></div>',
-      '<div class="panel stat"><div class="stat-label">Kept</div><div class="stat-value">0</div></div>',
-      '<div class="panel stat"><div class="stat-label">Best BPB</div><div class="stat-value">n/a</div></div>',
-    ].join('');
-    return;
-  }
-  const terminal = experiments.length;
-  const kept = experiments.filter((item) => item.status === 'keep' || item.status === 'replicate');
-  const best = kept.reduce((bestSoFar, item) => {
-    if (!bestSoFar) return item;
-    return item.val_bpb < bestSoFar.val_bpb ? item : bestSoFar;
-  }, null);
-  const crashes = experiments.filter((item) => item.status === 'crash').length;
-  const latest = experiments[experiments.length - 1];
-  stats.innerHTML = [
-    `<div class="panel stat"><div class="stat-label">Runs</div><div class="stat-value">${terminal}</div></div>`,
-    `<div class="panel stat"><div class="stat-label">Kept</div><div class="stat-value">${kept.length}</div></div>`,
-    `<div class="panel stat"><div class="stat-label">Best BPB</div><div class="stat-value">${best ? fmt(best.val_bpb, 6) : 'n/a'}</div><div class="muted mono">${best ? escapeHtml(best.commit) : ''}</div></div>`,
-    `<div class="panel stat"><div class="stat-label">Crashes</div><div class="stat-value">${crashes}</div></div>`,
-    `<div class="panel stat"><div class="stat-label">Latest</div><div class="stat-value">${escapeHtml(runLabel(latest))}</div><div class="muted mono">${escapeHtml(latest.commit)}</div></div>`,
-  ].join('');
-}
-
-function lineageSet(exp) {
-  const byCommit = new Map(experiments.map((item) => [item.commit, item]));
-  const related = new Set();
-  let cursor = exp;
-  while (cursor) {
-    related.add(cursor.id);
-    cursor = cursor.parent_commit ? byCommit.get(cursor.parent_commit) : null;
-  }
-
-  const queue = [exp];
-  while (queue.length) {
-    const current = queue.shift();
-    for (const child of experiments.filter((item) => item.parent_commit === current.commit)) {
-      if (!related.has(child.id)) {
-        related.add(child.id);
-        queue.push(child);
-      }
-    }
-  }
-  return related;
-}
-
-function buildLayout() {
-  const wrap = document.getElementById('graph-wrap');
-  const count = Math.max(experiments.length, 1);
-  graphWidth = Math.max(wrap.clientWidth - 2, count * 150);
-
-  const yValues = experiments.map((item) => item.val_bpb);
-  const minY = yValues.length ? Math.min(...yValues) : 0;
-  const maxY = yValues.length ? Math.max(...yValues) : 1;
-  const range = Math.max(maxY - minY, 0.01);
-
-  return experiments.map((item, index) => {
-    const x = count === 1
-      ? graphWidth / 2
-      : padding.left + (index / (count - 1)) * (graphWidth - padding.left - padding.right);
-    const y = padding.top + ((item.val_bpb - minY) / range) * (graphHeight - padding.top - padding.bottom);
-    const radius = item.status === 'keep' ? 16 : item.status === 'replicate' ? 14 : item.status === 'crash' ? 11 : 10;
-    return { ...item, x, y, radius };
-  });
-}
-
-function paramChanges(exp) {
-  const parent = experiments.find((item) => item.commit === exp.parent_commit);
-  if (!parent) return [];
-  return PARAM_KEYS.flatMap((key) => {
-    const before = parent[key];
-    const after = exp[key];
-    if (before == null || after == null) return [];
-    if (String(before) === String(after)) return [];
-    return [{ key, before, after }];
-  });
-}
-
-async function showDetail(exp) {
-  selectedId = exp.id;
-  const detail = document.getElementById('detail');
-  const empty = document.getElementById('detail-empty');
-  empty.hidden = true;
-  detail.hidden = false;
-
-  const changes = paramChanges(exp);
-  const checkpoints = Array.isArray(exp.bpb_at_checkpoints) ? exp.bpb_at_checkpoints : [];
-  const kvRows = [
-    ['Commit', `<span class="mono">${escapeHtml(exp.commit || 'unknown')}</span>`],
-    ['Parent', `<span class="mono">${escapeHtml(exp.parent_commit || 'root')}</span>`],
-    ['Timestamp', escapeHtml(exp.timestamp || 'n/a')],
-    ['Execution', escapeHtml(exp.execution_status || 'n/a')],
-    ['Decision', escapeHtml(exp.decision_status || exp.status || 'n/a')],
-    ['Worker', escapeHtml(exp.worker_id || 'n/a')],
-    ['GPU', escapeHtml(exp.gpu_name || (exp.gpu_id ? 'GPU ' + exp.gpu_id : 'n/a'))],
-    ['Hypothesis', escapeHtml(exp.hypothesis_id || 'n/a')],
-  ].map(([key, value]) => `<div class="k">${key}</div><div>${value}</div>`).join('');
-
-  detail.innerHTML = `
-    <div class="detail-title">
-      <h2>${escapeHtml(runLabel(exp))}</h2>
-      ${statusBadge(exp.status)}
-    </div>
-    <div class="hero-value">${fmt(exp.val_bpb, 6)}</div>
-    <div class="hero-sub">val_bpb</div>
-
-    <div class="detail-block">
-      <div class="kv">${kvRows}</div>
-      <div class="muted mono" style="margin-top:10px;">run_id ${escapeHtml(exp.id || 'n/a')}</div>
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Decision</div>
-      <div>${escapeHtml(exp.description || 'No description')}</div>
-      ${exp.rationale ? `<div class="muted" style="margin-top:10px;"><strong>Rationale:</strong> ${escapeHtml(exp.rationale)}</div>` : ''}
-      ${exp.outcome ? `<div class="muted" style="margin-top:10px;"><strong>Outcome:</strong> ${escapeHtml(exp.outcome)}</div>` : ''}
-      ${exp.notes ? `<div class="muted" style="margin-top:10px;"><strong>Notes:</strong> ${escapeHtml(exp.notes)}</div>` : ''}
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Scientific Decision Markdown</div>
-      <div class="muted" id="decision-path">Loading decision.md path...</div>
-      <button class="diff-toggle" id="decision-toggle" type="button">Load decision.md</button>
-      <pre class="decision-md" id="decision-md" hidden></pre>
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Hyperparameter Delta</div>
-      ${changes.length ? `<div class="pill-row">${changes.map((item) => `<div class="pill">${escapeHtml(item.key)} ${escapeHtml(item.before)} → ${escapeHtml(item.after)}</div>`).join('')}</div>` : '<div class="muted">No parent diff available.</div>'}
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Metrics</div>
-      <div class="grid">
-        ${metricCard('Delta vs prior best', fmt(exp.delta, 6))}
-        ${metricCard('Train BPB', fmt(exp.train_bpb, 6))}
-        ${metricCard('Steps', escapeHtml(exp.num_steps ?? '0'))}
-        ${metricCard('tok/sec', escapeHtml((exp.tokens_per_second ?? 0).toLocaleString()))}
-        ${metricCard('Train seconds', fmt(exp.training_seconds, 1))}
-        ${metricCard('Total seconds', fmt(exp.total_seconds, 1))}
-        ${metricCard('VRAM GB', fmt(exp.peak_vram_gb, 2))}
-        ${metricCard('Params M', fmt(exp.num_params_M, 2))}
-      </div>
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Architecture</div>
-      <div class="pill-row">
-        <div class="pill">depth ${escapeHtml(exp.depth)}</div>
-        <div class="pill">model_dim ${escapeHtml(exp.model_dim)}</div>
-        <div class="pill">n_heads ${escapeHtml(exp.n_heads)}</div>
-        <div class="pill">head_dim ${escapeHtml(exp.head_dim)}</div>
-        <div class="pill">window ${escapeHtml(exp.window_pattern || 'n/a')}</div>
-        <div class="pill">batch ${escapeHtml(exp.total_batch_size)}</div>
-        <div class="pill">device_batch ${escapeHtml(exp.device_batch_size)}</div>
-      </div>
-    </div>
-
-    <div class="detail-block">
-      <div class="section-title">Convergence</div>
-      ${checkpoints.length ? `<div class="pill-row">${checkpoints.map((value, index) => `<div class="pill">${(index + 1) * 25}% ${fmt(value, 4)}</div>`).join('')}</div>` : '<div class="muted">No checkpoint samples recorded.</div>'}
-      ${exp.still_improving ? '<div class="muted" style="margin-top:10px;">Loss was still improving at budget end.</div>' : ''}
-    </div>
-
-    <button class="diff-toggle" id="diff-toggle" type="button">Load train.py diff</button>
-    <pre class="diff" id="diff" hidden></pre>
-  `;
-
-  document.getElementById('diff-toggle').addEventListener('click', async () => {
-    const diff = document.getElementById('diff');
-    if (!diff.hidden) {
-      diff.hidden = true;
-      return;
-    }
-    diff.textContent = 'Loading diff...';
-    diff.hidden = false;
-    try {
-      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/diff`);
-      const payload = res.ok ? await res.json() : { diff: '' };
-      diff.textContent = payload.diff || 'No diff available for this experiment.';
-    } catch (error) {
-      diff.textContent = 'Failed to load diff.';
-    }
-  });
-
-  document.getElementById('decision-toggle').addEventListener('click', async () => {
-    const md = document.getElementById('decision-md');
-    if (!md.hidden) {
-      md.hidden = true;
-      return;
-    }
-    md.textContent = 'Loading decision markdown...';
-    md.hidden = false;
-    try {
-      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/decision-md`);
-      const payload = res.ok ? await res.json() : { content: '', path: '' };
-      const pathEl = document.getElementById('decision-path');
-      pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
-      md.textContent = payload.content || 'No scientific decision markdown available for this run.';
-    } catch (error) {
-      md.textContent = 'Failed to load decision markdown.';
-    }
-  });
-
-  (async () => {
-    try {
-      const res = await fetch(`/api/experiments/${encodeURIComponent(String(exp.id))}/decision-md`);
-      const payload = res.ok ? await res.json() : {};
-      const pathEl = document.getElementById('decision-path');
-      pathEl.textContent = payload.path || 'No scientific decision markdown recorded yet.';
-    } catch (error) {
-      const pathEl = document.getElementById('decision-path');
-      pathEl.textContent = 'Failed to load decision markdown path.';
-    }
-  })();
-
-  renderGraph();
-}
-
-function renderGraph() {
-  const svg = document.getElementById('graph');
-  const empty = document.getElementById('graph-empty');
-  if (!experiments.length) {
-    empty.hidden = false;
-    svg.innerHTML = '';
-    return;
-  }
-  empty.hidden = true;
-
-  const layout = buildLayout();
-  const byCommit = new Map(layout.map((item) => [item.commit, item]));
-  const selected = selectedId != null ? layout.find((item) => item.id === selectedId) : null;
-  const related = selected ? lineageSet(selected) : new Set();
-
-  svg.setAttribute('viewBox', `0 0 ${graphWidth} ${graphHeight}`);
-  svg.setAttribute('width', String(graphWidth));
-  svg.setAttribute('height', String(graphHeight));
-
-  const yValues = layout.map((item) => item.val_bpb);
-  const minY = Math.min(...yValues);
-  const maxY = Math.max(...yValues);
-  const ticks = 4;
-
-  const gridLines = Array.from({ length: ticks + 1 }).map((_, index) => {
-    const y = padding.top + (index / ticks) * (graphHeight - padding.top - padding.bottom);
-    const value = minY + (index / ticks) * (maxY - minY || 1);
-    return `
-      <line x1="${padding.left}" y1="${y}" x2="${graphWidth - padding.right}" y2="${y}" stroke="rgba(148,163,184,0.12)" stroke-dasharray="4 8" />
-      <text x="${padding.left - 16}" y="${y + 4}" text-anchor="end" fill="rgba(147,164,188,0.85)" font-size="11">${fmt(value, 4)}</text>
-    `;
-  }).join('');
-
-  const edges = layout.map((item) => {
-    const parent = byCommit.get(item.parent_commit);
-    if (!parent) return '';
-    const active = !selected || (related.has(item.id) && related.has(parent.id));
-    const opacity = active ? 0.85 : 0.18;
-    const stroke = item.status === 'keep' || item.status === 'replicate' ? 'rgba(96, 165, 250, 0.72)' : 'rgba(148, 163, 184, 0.38)';
-    const dx = item.x - parent.x;
-    return `<path d="M ${parent.x} ${parent.y} C ${parent.x + dx * 0.45} ${parent.y}, ${item.x - dx * 0.45} ${item.y}, ${item.x} ${item.y}" fill="none" stroke="${stroke}" stroke-width="${active ? 2.4 : 1.4}" opacity="${opacity}" />`;
-  }).join('');
-
-  const nodes = layout.map((item) => {
-    const active = !selected || related.has(item.id);
-    const stroke = STATUS_COLORS[item.status] || '#cbd5e1';
-    const fill = item.status === 'discard' ? 'rgba(248, 113, 113, 0.16)' : item.status === 'crash' ? 'rgba(245, 158, 11, 0.18)' : item.status === 'replicate' ? 'rgba(96, 165, 250, 0.18)' : 'rgba(34, 197, 94, 0.18)';
-    const opacity = active ? 1 : 0.24;
-    const labelY = item.y - item.radius - 10;
-    return `
-      <g class="node" data-id="${item.id}" style="cursor:pointer;">
-        <circle cx="${item.x}" cy="${item.y}" r="${item.radius}" fill="${fill}" stroke="${stroke}" stroke-width="${selected && selected.id === item.id ? 4 : 2.2}" opacity="${opacity}" />
-        <text x="${item.x}" y="${item.y + 4}" text-anchor="middle" fill="rgba(229,237,247,0.9)" font-size="11" opacity="${opacity}">${escapeHtml(runLabel(item))}</text>
-        <text x="${item.x}" y="${labelY}" text-anchor="middle" fill="rgba(229,237,247,0.85)" font-size="11" opacity="${opacity}">${fmt(item.val_bpb, 4)}</text>
-      </g>
-    `;
-  }).join('');
-
-  svg.innerHTML = `
-    <rect x="0" y="0" width="${graphWidth}" height="${graphHeight}" fill="transparent" />
-    ${gridLines}
-    ${edges}
-    <text x="${graphWidth / 2}" y="${graphHeight - 16}" text-anchor="middle" fill="rgba(147,164,188,0.85)" font-size="12">experiment order</text>
-    <text x="22" y="${graphHeight / 2}" transform="rotate(-90 22 ${graphHeight / 2})" text-anchor="middle" fill="rgba(147,164,188,0.85)" font-size="12">val_bpb</text>
-    ${nodes}
-  `;
-
-  Array.from(svg.querySelectorAll('.node')).forEach((node) => {
-    node.addEventListener('click', () => {
-      const id = node.getAttribute('data-id');
-      const exp = experiments.find((item) => item.id === id);
-      if (exp) showDetail(exp);
-    });
-  });
-}
-
-async function loadExperiments() {
-  const res = await fetch('/api/experiments');
-  experiments = res.ok ? await res.json() : [];
-  experiments.sort(compareExperiments);
-  renderStats();
-  renderGraph();
-  if (selectedId != null) {
-    const selected = experiments.find((item) => item.id === selectedId);
-    if (selected) {
-      showDetail(selected);
-    }
-  }
-}
-
-window.addEventListener('resize', renderGraph);
-loadExperiments();
-setInterval(loadExperiments, 5000);
-"""
-
-
-def _page(title: str, body: str, script: str) -> str:
-    return f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{title}</title>
-    <style>{BASE_CSS}</style>
-  </head>
-  <body>
-    {body}
-    <script>{script}</script>
-  </body>
-</html>
-"""
+def _short_hash(h: str) -> str:
+    """Normalize a git hash to 7 characters for consistent matching."""
+    return h[:7] if h else ""
 
 
 def _load_records() -> list[dict]:
+    """Load all experiment records from the JSONL file."""
     if not EXPERIMENTS_FILE.exists():
         return []
     records = []
@@ -958,6 +45,12 @@ def _load_records() -> list[dict]:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    # Normalize commit hashes to short form for consistent lineage matching
+    for r in records:
+        if r.get("commit"):
+            r["commit"] = _short_hash(r["commit"])
+        if r.get("parent_commit"):
+            r["parent_commit"] = _short_hash(r["parent_commit"])
     records.sort(
         key=lambda item: (
             item.get("ordinal", 0),
@@ -994,6 +87,7 @@ def _relative_or_absolute(path: Path) -> str:
 def _find_run_dir_for_commit(commit: str) -> tuple[Path, dict, dict] | None:
     if not commit:
         return None
+    short = _short_hash(commit)
     runs_dir = REPO_ROOT / "research" / "runs"
     if not runs_dir.exists():
         return None
@@ -1003,7 +97,7 @@ def _find_run_dir_for_commit(commit: str) -> tuple[Path, dict, dict] | None:
         result = _read_json(run_dir / "result.json")
         metadata = _read_json(run_dir / "metadata.json")
         result_commit = result.get("commit") or metadata.get("runtime", {}).get("commit")
-        if result_commit == commit:
+        if _short_hash(result_commit or "") == short:
             return run_dir, result, metadata
     return None
 
@@ -1084,36 +178,70 @@ def _decision_markdown_for_record(record: dict) -> dict:
     }
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return _page("Autoresearch Dashboard", INDEX_BODY, INDEX_SCRIPT)
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup():
+    global _records
+    _records = _load_records()
+    asyncio.create_task(_tail_experiments())
 
 
-@app.get("/history", response_class=HTMLResponse)
-def history() -> str:
-    return _page("Autoresearch History", HISTORY_BODY, HISTORY_SCRIPT)
+# ---------------------------------------------------------------------------
+# SSE endpoint
+# ---------------------------------------------------------------------------
 
+@app.get("/stream")
+async def stream(request: Request):
+    q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _subscribers.append(q)
+
+    async def generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15)
+                    yield {"data": json.dumps(event)}
+                except asyncio.TimeoutError:
+                    yield {"comment": "keepalive"}
+        finally:
+            try:
+                _subscribers.remove(q)
+            except ValueError:
+                pass
+
+    return EventSourceResponse(generator())
+
+
+# ---------------------------------------------------------------------------
+# REST API
+# ---------------------------------------------------------------------------
 
 @app.get("/api/experiments")
-def list_experiments() -> list[dict]:
-    return _load_records()
+async def list_experiments():
+    return _records
 
 
 @app.get("/api/experiments/{exp_id}")
-def get_experiment(exp_id: str):
-    for record in _load_records():
-        if str(record.get("id")) == exp_id:
-            return record
+async def get_experiment(exp_id: str):
+    for r in _records:
+        if str(r.get("id")) == exp_id:
+            return r
     return JSONResponse(status_code=404, content={"error": "not found"})
 
 
 @app.get("/api/experiments/{exp_id}/diff")
-def get_diff(exp_id: str):
-    for record in _load_records():
-        if str(record.get("id")) != exp_id:
+async def get_diff(exp_id: str):
+    """Return unified diff between parent_commit and commit for an experiment."""
+    for r in _records:
+        if str(r.get("id")) != exp_id:
             continue
-        commit = record.get("commit", "")
-        parent = record.get("parent_commit", "")
+        commit = r.get("commit", "")
+        parent = r.get("parent_commit", "")
         if not commit or not parent:
             return {"diff": ""}
         try:
@@ -1131,8 +259,358 @@ def get_diff(exp_id: str):
 
 
 @app.get("/api/experiments/{exp_id}/decision-md")
-def get_decision_markdown(exp_id: str):
+async def get_decision_markdown(exp_id: str):
     record = _load_record(exp_id)
     if record is None:
         return JSONResponse(status_code=404, content={"error": "not found"})
     return _decision_markdown_for_record(record)
+
+
+# ---------------------------------------------------------------------------
+# Research data API
+# ---------------------------------------------------------------------------
+
+RESEARCH_DIR = REPO_ROOT / "research"
+
+
+@app.get("/api/research/brief")
+async def research_brief():
+    return _read_json(RESEARCH_DIR / "research_brief.json") or {}
+
+
+@app.get("/api/research/leaderboard")
+async def research_leaderboard():
+    return _read_json(RESEARCH_DIR / "aggregate" / "leaderboard.json") or {}
+
+
+@app.get("/api/research/run/{exp_id}")
+async def research_run(exp_id: str):
+    """Return merged run data: result.json + config.json + plan JSON + plan markdown."""
+    run_dir = RESEARCH_DIR / "runs" / exp_id
+    plans_dir = RESEARCH_DIR / "plans"
+    out: dict = {"experiment_id": exp_id}
+
+    if run_dir.is_dir():
+        out["result"] = _read_json(run_dir / "result.json")
+        out["config"] = _read_json(run_dir / "config.json")
+        out["metadata"] = _read_json(run_dir / "metadata.json")
+
+    plan_json = plans_dir / f"{exp_id}.json"
+    if plan_json.exists():
+        out["plan"] = _read_json(plan_json)
+
+    plan_md = plans_dir / f"{exp_id}.md"
+    if plan_md.exists():
+        out["plan_markdown"] = plan_md.read_text()
+
+    return out
+
+
+@app.get("/api/research/top")
+async def research_top():
+    """Return the top 10 experiments by val_bpb with their hypotheses."""
+    records = _load_records()
+    kept = [r for r in records if r.get("status") == "keep"]
+    kept.sort(key=lambda r: r.get("val_bpb", float("inf")))
+    top = kept[:10]
+
+    results = []
+    plans_dir = RESEARCH_DIR / "plans"
+    for r in top:
+        exp_id = str(r.get("id", ""))
+        plan = _read_json(plans_dir / f"{exp_id}.json")
+        hypothesis = plan.get("hypothesis", {})
+        run_result = _read_json(RESEARCH_DIR / "runs" / exp_id / "result.json")
+        results.append({
+            "id": exp_id,
+            "val_bpb": r.get("val_bpb"),
+            "delta": r.get("delta"),
+            "description": r.get("description", ""),
+            "status": r.get("status"),
+            "commit": r.get("commit", ""),
+            "hypothesis_title": hypothesis.get("title", ""),
+            "hypothesis_rationale": hypothesis.get("rationale", ""),
+            "prediction": hypothesis.get("prediction", ""),
+            "changes_from_baseline": run_result.get("changes_from_baseline", {}),
+            "num_steps": r.get("num_steps", 0),
+            "training_seconds": r.get("training_seconds", 0),
+            "mfu_percent": r.get("mfu_percent", 0),
+            "peak_vram_gb": r.get("peak_vram_gb", 0),
+        })
+    return results
+
+
+@app.get("/api/research/lineage")
+async def research_lineage():
+    """Infer experiment-to-experiment lineage.
+
+    Strategy:
+    1. Parse description/title for explicit 'exp-NNN' references.
+    2. For experiments without an explicit parent, assign the most recent
+       'keep' experiment with a lower ordinal as the parent (representing
+       the best-known config they branched from).
+    """
+    import re
+
+    records = _load_records()
+    runs_dir = RESEARCH_DIR / "runs"
+    ids = {str(r.get("id", "")) for r in records}
+    id_list = [str(r.get("id", "")) for r in records]
+
+    edges: list[dict] = []
+    assigned: set[str] = set()
+
+    # Pass 1: explicit references from descriptions/titles
+    for r in records:
+        exp_id = str(r.get("id", ""))
+        desc = r.get("description", "") or ""
+
+        # Also check result.json title
+        result = _read_json(runs_dir / exp_id / "result.json")
+        title = result.get("title", "") or result.get("description", "") or ""
+        text = title or desc
+
+        own_match = re.match(r"exp-(\d+)", exp_id)
+        own_prefix = own_match.group(0) if own_match else ""
+
+        refs = re.findall(r"exp-(\d+)", text)
+        parent_id = None
+        for ref_num in refs:
+            ref_prefix = f"exp-{ref_num}"
+            if ref_prefix == own_prefix:
+                continue
+            for eid in ids:
+                if eid.startswith(ref_prefix + "-") or eid == ref_prefix:
+                    parent_id = eid
+                    break
+            if parent_id:
+                break
+
+        if parent_id:
+            edges.append({"from": parent_id, "to": exp_id, "type": "explicit"})
+            assigned.add(exp_id)
+
+    # Pass 2: for unassigned experiments, link to the most recent prior 'keep'
+    # Only link within the same experiment family (exp-* to exp-*, karpathy-* to karpathy-*)
+    # Skip benchmark/comparison experiments — they aren't part of the research lineage
+    def _family(eid: str) -> str:
+        return eid.split("-")[0] if "-" in eid else eid
+
+    benchmark_ids: set[str] = set()
+    for r in records:
+        desc = (r.get("description", "") or "").lower()
+        if "benchmark" in desc or "upstream" in desc:
+            benchmark_ids.add(str(r.get("id", "")))
+
+    keep_ids = [
+        str(r.get("id", ""))
+        for r in records
+        if r.get("status") == "keep" and str(r.get("id", "")) not in benchmark_ids
+    ]
+    for i, exp_id in enumerate(id_list):
+        if exp_id in assigned or exp_id in benchmark_ids:
+            continue
+        fam = _family(exp_id)
+        prior_keep = None
+        for kid in keep_ids:
+            if _family(kid) == fam and id_list.index(kid) < i:
+                prior_keep = kid
+        if prior_keep and prior_keep != exp_id:
+            edges.append({"from": prior_keep, "to": exp_id, "type": "inferred"})
+
+    return edges
+
+
+@app.get("/api/research/config-diff/{exp_id}")
+async def research_config_diff(exp_id: str):
+    """Diff the config of exp_id against its lineage parent's config."""
+    runs_dir = RESEARCH_DIR / "runs"
+
+    child_cfg = _read_json(runs_dir / exp_id / "config.json")
+    child_hp = child_cfg.get("hyperparameters", {})
+    if not child_hp:
+        return {"has_diff": False, "reason": "no config for this experiment"}
+
+    # Find parent from lineage (same logic as lineage endpoint)
+    import re
+    records = _load_records()
+    id_list = [str(r.get("id", "")) for r in records]
+    ids = set(id_list)
+
+    # Try explicit parent from description
+    record = None
+    for r in records:
+        if str(r.get("id", "")) == exp_id:
+            record = r
+            break
+    if not record:
+        return {"has_diff": False, "reason": "experiment not found"}
+
+    result = _read_json(runs_dir / exp_id / "result.json")
+    text = result.get("title", "") or result.get("description", "") or record.get("description", "")
+    own_match = re.match(r"exp-(\d+)", exp_id)
+    own_prefix = own_match.group(0) if own_match else ""
+
+    parent_id = None
+    for ref_num in re.findall(r"exp-(\d+)", text):
+        ref_prefix = f"exp-{ref_num}"
+        if ref_prefix == own_prefix:
+            continue
+        for eid in ids:
+            if eid.startswith(ref_prefix + "-") or eid == ref_prefix:
+                parent_id = eid
+                break
+        if parent_id:
+            break
+
+    # Fallback to most recent prior keep
+    if not parent_id:
+        def _family(eid: str) -> str:
+            return eid.split("-")[0] if "-" in eid else eid
+        fam = _family(exp_id)
+        keep_ids = [str(r.get("id", "")) for r in records if r.get("status") == "keep"]
+        idx = id_list.index(exp_id) if exp_id in id_list else -1
+        for kid in keep_ids:
+            if _family(kid) == fam and id_list.index(kid) < idx:
+                parent_id = kid
+
+    if not parent_id:
+        return {"has_diff": False, "reason": "no parent found"}
+
+    parent_cfg = _read_json(runs_dir / parent_id / "config.json")
+    parent_hp = parent_cfg.get("hyperparameters", {})
+
+    if not parent_hp:
+        # Use baseline config
+        baseline_cfg = _read_json(runs_dir / "exp-000-baseline" / "config.json")
+        parent_hp = baseline_cfg.get("hyperparameters", {})
+        parent_id = "exp-000-baseline"
+
+    if not parent_hp:
+        return {"has_diff": False, "reason": "no parent config"}
+
+    all_keys = sorted(set(list(child_hp.keys()) + list(parent_hp.keys())))
+    diff = []
+    for k in all_keys:
+        if k == "base_experiment":
+            continue
+        old = parent_hp.get(k)
+        new = child_hp.get(k)
+        if str(old) != str(new):
+            diff.append({"key": k, "old": old, "new": new})
+
+    return {
+        "has_diff": len(diff) > 0,
+        "parent_id": parent_id,
+        "child_id": exp_id,
+        "changes": diff,
+        "parent_config": parent_hp,
+        "child_config": child_hp,
+    }
+
+
+@app.get("/api/research/strategies")
+async def research_strategies():
+    """Analyze which hyperparameter changes led to keeps vs discards."""
+    records = _load_records()
+    plans_dir = RESEARCH_DIR / "plans"
+    runs_dir = RESEARCH_DIR / "runs"
+
+    categories: dict[str, dict] = {}
+
+    for r in records:
+        exp_id = str(r.get("id", ""))
+        status = r.get("status", "")
+        run_result = _read_json(runs_dir / exp_id / "result.json")
+        changes = run_result.get("changes_from_baseline", {})
+        if not changes:
+            continue
+
+        changed_params = {
+            k for k in changes
+            if k != "base_experiment" and not k.startswith("_")
+        }
+
+        for param in changed_params:
+            if param not in categories:
+                categories[param] = {"kept": 0, "discarded": 0, "crashed": 0, "total": 0}
+            categories[param]["total"] += 1
+            if status == "keep":
+                categories[param]["kept"] += 1
+            elif status == "crash":
+                categories[param]["crashed"] += 1
+            else:
+                categories[param]["discarded"] += 1
+
+    result = [
+        {"param": k, **v, "keep_rate": round(v["kept"] / v["total"], 3) if v["total"] > 0 else 0}
+        for k, v in sorted(categories.items(), key=lambda x: -x[1]["total"])
+    ]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# File tailer — watches experiments.jsonl for new records
+# ---------------------------------------------------------------------------
+
+async def _tail_experiments():
+    """Tail experiments.jsonl for new records, push to SSE subscribers."""
+    pos = EXPERIMENTS_FILE.stat().st_size if EXPERIMENTS_FILE.exists() else 0
+
+    while True:
+        await asyncio.sleep(1.0)
+        if not EXPERIMENTS_FILE.exists():
+            continue
+
+        size = EXPERIMENTS_FILE.stat().st_size
+        if size <= pos:
+            if size < pos:
+                pos = 0  # file was truncated
+            continue
+
+        try:
+            with open(EXPERIMENTS_FILE) as f:
+                f.seek(pos)
+                new_data = f.read()
+                pos = f.tell()
+
+            for line in new_data.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                _records.append(record)
+                event = {"type": "new_experiment", **record}
+                for q in list(_subscribers):
+                    try:
+                        q.put_nowait(event)
+                    except asyncio.QueueFull:
+                        pass
+
+        except Exception as e:
+            print(f"[server] error tailing experiments.jsonl: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Static files (Svelte build) — must be last so it doesn't shadow API routes
+# ---------------------------------------------------------------------------
+
+_dist = Path(__file__).parent / "frontend" / "build"
+if _dist.exists():
+    from fastapi.responses import FileResponse
+
+    app.mount("/_app", StaticFiles(directory=str(_dist / "_app")), name="static-app")
+
+    _fallback = _dist / "index.html"
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        """Serve static files if they exist, otherwise fall back to index.html for SPA routing."""
+        candidate = _dist / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_fallback)

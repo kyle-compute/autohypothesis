@@ -19,7 +19,7 @@
 			</a>
 			<a href="/history" class="nav-link">
 				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-					<path d="M2 2v4h4M2 8a6 6 0 1 1 1.76 4.24"/>
+					<circle cx="3" cy="12" r="2"/><circle cx="8" cy="4" r="2"/><circle cx="13" cy="10" r="2"/><line x1="5" y1="10.5" x2="6.5" y2="5.5"/><line x1="9.5" y1="5.5" x2="11.5" y2="8.5"/>
 				</svg>
 				Decisions
 			</a>

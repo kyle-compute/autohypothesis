@@ -1,11 +1,13 @@
 <script lang="ts">
 	import type { Experiment, ParamChange } from '$lib/types';
 	import { HYPERPARAM_KEYS } from '$lib/types';
+	import type { LineageEdge } from '$lib/api';
 
-	let { experiments = [], onSelect = (_e: Experiment | null) => {}, focusId = null as number | null }: {
+	let { experiments = [], lineageEdges = [], onSelect = (_e: Experiment | null) => {}, focusId = null as string | null }: {
 		experiments: Experiment[];
+		lineageEdges?: LineageEdge[];
 		onSelect?: (e: Experiment | null) => void;
-		focusId?: number | null;
+		focusId?: string | null;
 	} = $props();
 
 	// --- Container & sizing ---
@@ -31,18 +33,23 @@
 	let panOrigin = { x: 0, y: 0, tx: 0, ty: 0 };
 
 	// --- Interaction state ---
-	let selectedId: number | null = $state(null);
-	let hoveredId: number | null = $state(null);
+	let selectedId: string | null = $state(null);
+	let hoveredId: string | null = $state(null);
 
 	// --- Constants ---
 	const PAD = 80;
-	const R_KEEP = 26;
-	const R_DISCARD = 15;
-	const R_CRASH = 12;
+	const R_KEEP = 36;
+	const R_DISCARD = 26;
+	const R_CRASH = 20;
+
+	function shortLabel(id: string): string {
+		const m = id.match(/^exp-(\d+)/);
+		return m ? m[1].replace(/^0+/, '') || '0' : id.slice(0, 6);
+	}
 
 	// --- Graph data ---
 	interface GNode {
-		id: number;
+		id: string;
 		exp: Experiment;
 		x: number;
 		y: number;
@@ -53,10 +60,11 @@
 	}
 
 	interface GEdge {
-		fromId: number;
-		toId: number;
+		fromId: string;
+		toId: string;
 		path: string;
 		kept: boolean;
+		inferred: boolean;
 	}
 
 	let graphNodes = $derived.by((): GNode[] => {
@@ -68,16 +76,14 @@
 		const bpbRange = maxBpb - minBpb || 0.1;
 		const bpbPad = bpbRange * 0.15;
 
-		const ids = experiments.map(e => e.id);
-		const minId = Math.min(...ids);
-		const maxId = Math.max(...ids);
-		const idRange = maxId - minId || 1;
+		const count = experiments.length;
+		const maxIndex = count - 1 || 1;
 
-		const gw = Math.max(width * 1.2, (maxId - minId + 1) * 120);
+		const gw = Math.max(width * 1.2, count * 120);
 		const gh = Math.max(height * 0.9, 500);
 
-		return experiments.map(exp => {
-			const x = PAD + ((exp.id - minId) / idRange) * (gw - PAD * 2);
+		return experiments.map((exp, index) => {
+			const x = PAD + (index / maxIndex) * (gw - PAD * 2);
 			const y = PAD + ((exp.val_bpb - (minBpb - bpbPad)) / (bpbRange + bpbPad * 2)) * (gh - PAD * 2);
 
 			const isKeep = exp.status === 'keep';
@@ -109,45 +115,59 @@
 	});
 
 	let graphEdges = $derived.by((): GEdge[] => {
-		const nodeByCommit = new Map<string, GNode>();
+		const nodeById = new Map<string, GNode>();
 		for (const n of graphNodes) {
-			nodeByCommit.set(n.exp.commit, n);
+			nodeById.set(n.id, n);
 		}
-		return graphNodes
-			.filter(n => n.exp.parent_commit && nodeByCommit.has(n.exp.parent_commit))
-			.map(n => {
-				const p = nodeByCommit.get(n.exp.parent_commit)!;
+		return lineageEdges
+			.filter(e => nodeById.has(e.from) && nodeById.has(e.to))
+			.map(e => {
+				const p = nodeById.get(e.from)!;
+				const n = nodeById.get(e.to)!;
 				const dx = n.x - p.x;
+				const dy = n.y - p.y;
 				return {
 					fromId: p.id,
 					toId: n.id,
-					path: `M${p.x},${p.y} C${p.x + dx * 0.5},${p.y} ${n.x - dx * 0.5},${n.y} ${n.x},${n.y}`,
-					kept: n.exp.status === 'keep',
+					path: `M${p.x},${p.y} C${p.x + dx * 0.4},${p.y + dy * 0.1} ${n.x - dx * 0.4},${n.y - dy * 0.1} ${n.x},${n.y}`,
+					kept: p.exp.status === 'keep' && n.exp.status === 'keep',
+					inferred: e.type === 'inferred',
 				};
 			});
 	});
 
-	// Lineage set for highlighting
-	let lineageSet = $derived.by((): Set<number> => {
+	// Lineage set for highlighting — walk lineageEdges bidirectionally
+	let lineageSet = $derived.by((): Set<string> => {
 		const target = hoveredId ?? selectedId;
 		if (target == null) return new Set();
-		const set = new Set<number>();
-		// Walk ancestors by commit chain
-		let cur = experiments.find(e => e.id === target);
-		while (cur) {
-			set.add(cur.id);
-			cur = cur.parent_commit ? experiments.find(e => e.commit === cur!.parent_commit) : undefined;
+
+		// Build adjacency from lineageEdges
+		const children = new Map<string, string[]>();
+		const parents = new Map<string, string[]>();
+		for (const e of lineageEdges) {
+			if (!children.has(e.from)) children.set(e.from, []);
+			children.get(e.from)!.push(e.to);
+			if (!parents.has(e.to)) parents.set(e.to, []);
+			parents.get(e.to)!.push(e.from);
+		}
+
+		const set = new Set<string>();
+		// Walk ancestors
+		const aQueue = [target];
+		while (aQueue.length) {
+			const id = aQueue.shift()!;
+			if (set.has(id)) continue;
+			set.add(id);
+			for (const p of parents.get(id) ?? []) aQueue.push(p);
 		}
 		// Walk descendants
-		const queue = [experiments.find(e => e.id === target)!];
-		while (queue.length) {
-			const e = queue.shift()!;
-			set.add(e.id);
-			for (const child of experiments.filter(c => c.parent_commit === e.commit)) {
-				if (!set.has(child.id)) {
-					set.add(child.id);
-					queue.push(child);
-				}
+		const dQueue = [target];
+		while (dQueue.length) {
+			const id = dQueue.shift()!;
+			if (set.has(id) && id !== target) continue;
+			set.add(id);
+			for (const c of children.get(id) ?? []) {
+				if (!set.has(c)) dQueue.push(c);
 			}
 		}
 		return set;
@@ -297,10 +317,10 @@
 				<path
 					d={edge.path}
 					fill="none"
-					stroke={edge.kept ? '#16A34A' : '#D1CEBF'}
-					stroke-width={edge.kept ? 2.5 : 1.5}
-					stroke-dasharray={edge.kept ? 'none' : '6,4'}
-					opacity={hasLineage ? (inLineage ? 1 : 0.1) : 0.6}
+					stroke={edge.kept ? '#16A34A' : edge.inferred ? 'rgba(148,163,184,0.25)' : '#D1CEBF'}
+					stroke-width={edge.kept ? 2.5 : edge.inferred ? 1 : 1.5}
+					stroke-dasharray={edge.kept ? 'none' : edge.inferred ? '4,6' : '6,4'}
+					opacity={hasLineage ? (inLineage ? 1 : 0.08) : edge.kept ? 0.8 : edge.inferred ? 0.3 : 0.6}
 					class="graph-edge"
 				/>
 			{/each}
@@ -335,18 +355,18 @@
 						text-anchor="middle"
 						dominant-baseline="central"
 						class="node-label"
-						fill={node.exp.status === 'keep' ? 'white' : '#57534E'}
-						font-size={node.exp.status === 'keep' ? '11' : '9'}
+						fill={node.exp.status === 'keep' ? 'white' : '#A8A29E'}
+						font-size={node.exp.status === 'keep' ? '14' : '11'}
 						font-weight="700"
 					>
-						{node.exp.id}
+						{shortLabel(node.exp.id)}
 					</text>
 					<text
-						y={node.r + 14}
+						y={node.r + 16}
 						text-anchor="middle"
 						class="node-bpb"
 						fill="#78716C"
-						font-size="10"
+						font-size="11"
 					>
 						{node.exp.val_bpb.toFixed(3)}
 					</text>
@@ -367,10 +387,10 @@
 	{#if tooltipNode && hoveredId !== selectedId}
 		<div class="tooltip" style="left: {tooltipX}px; top: {tooltipY - tooltipNode.r * sc - 12}px;">
 			<div class="tt-header">
-				<span class="tt-iter">#{tooltipNode.exp.id}</span>
-				<span class="tt-id">{tooltipNode.exp.commit}</span>
+				<span class="tt-iter">{tooltipNode.exp.id}</span>
 				<span class="tt-badge {tooltipNode.exp.status}">{tooltipNode.exp.status}</span>
 			</div>
+			<div class="tt-commit">{tooltipNode.exp.commit.slice(0, 7)}</div>
 			<div class="tt-bpb">
 				{tooltipNode.exp.val_bpb.toFixed(6)}
 				{#if tooltipNode.exp.delta !== 0}
@@ -379,7 +399,9 @@
 					</span>
 				{/if}
 			</div>
-			<div class="tt-desc">{tooltipNode.exp.description}</div>
+			{#if tooltipNode.exp.description}
+				<div class="tt-desc">{tooltipNode.exp.description}</div>
+			{/if}
 			{#if tooltipNode.paramChanges.length > 0}
 				<div class="tt-params">
 					{#each tooltipNode.paramChanges as ch}
@@ -401,12 +423,6 @@
 		<span>@yimothysu</span>
 	</div>
 
-	<!-- Fit button -->
-	<button class="fit-btn" onclick={fitToView} title="Fit to view">
-		<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-			<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>
-		</svg>
-	</button>
 </div>
 
 <style>
@@ -447,24 +463,25 @@
 		font-size: 0.78rem;
 		pointer-events: none;
 		z-index: 50;
-		max-width: 340px;
+		max-width: 280px;
 		box-shadow: 0 8px 24px rgba(0,0,0,0.3);
 	}
-	.tt-header { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem; }
-	.tt-iter { font-family: var(--font-mono); font-weight: 700; font-size: 0.85rem; }
-	.tt-id { font-family: var(--font-mono); font-size: 0.7rem; opacity: 0.5; }
+	.tt-header { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.1rem; }
+	.tt-iter { font-family: var(--font-mono); font-weight: 700; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.tt-commit { font-family: var(--font-mono); font-size: 0.65rem; opacity: 0.4; margin-bottom: 0.25rem; }
 	.tt-badge {
 		font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
-		letter-spacing: 0.04em; padding: 0.1rem 0.35rem; border-radius: 4px; margin-left: auto;
+		letter-spacing: 0.04em; padding: 0.1rem 0.35rem; border-radius: 4px; margin-left: auto; flex-shrink: 0;
 	}
 	.tt-badge.keep { background: rgba(22,163,74,0.2); color: #4ADE80; }
 	.tt-badge.discard { background: rgba(220,38,38,0.2); color: #FCA5A5; }
 	.tt-badge.crash { background: rgba(180,83,9,0.2); color: #FCD34D; }
+	.tt-badge.replicate { background: rgba(96,165,250,0.2); color: #93C5FD; }
 	.tt-bpb { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600; margin-bottom: 0.25rem; }
 	.tt-delta { font-size: 0.72rem; font-weight: 500; margin-left: 0.35rem; }
 	.tt-delta.good { color: #4ADE80; }
 	.tt-delta.bad { color: #FCA5A5; }
-	.tt-desc { font-size: 0.75rem; color: #D6D3D1; line-height: 1.35; white-space: normal; margin-bottom: 0.2rem; }
+	.tt-desc { font-size: 0.72rem; color: #D6D3D1; line-height: 1.35; white-space: normal; margin-bottom: 0.2rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 	.tt-params { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
 	.tt-pill { font-family: var(--font-mono); font-size: 0.65rem; background: rgba(255,255,255,0.08); padding: 0.1rem 0.4rem; border-radius: 999px; color: #A8A29E; }
 	.tt-flag { font-size: 0.68rem; color: #FCD34D; margin-top: 0.25rem; font-style: italic; }
@@ -479,13 +496,4 @@
 	}
 	.x-logo { flex-shrink: 0; }
 
-	/* Fit button */
-	.fit-btn {
-		position: absolute; bottom: 12px; right: 12px;
-		background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
-		width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
-		cursor: pointer; color: var(--text-dim); box-shadow: var(--shadow-sm);
-		transition: all 0.15s ease; z-index: 10;
-	}
-	.fit-btn:hover { color: var(--text); border-color: var(--border-strong); box-shadow: var(--shadow-md); }
 </style>
