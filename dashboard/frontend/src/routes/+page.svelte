@@ -328,7 +328,12 @@
 				<div class="chip"><span class="chip-val discard-c">{discardCount}</span><span class="chip-lbl">Discarded</span></div>
 				{#if crashCount > 0}<div class="chip"><span class="chip-val crash-c">{crashCount}</span><span class="chip-lbl">Crashed</span></div>{/if}
 			</div>
-			<div class="viz-tabs"></div>
+			<div class="x-links">
+					<svg class="x-logo" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+					<a href="https://x.com/kylecompute" target="_blank" rel="noopener">@kylecompute</a>
+					<a href="https://x.com/patrikkml" target="_blank" rel="noopener">@patrikkml</a>
+					<a href="https://x.com/yimothysu" target="_blank" rel="noopener">@yimothysu</a>
+				</div>
 		</div>
 
 		<div class="viz-area">
@@ -679,10 +684,10 @@
 	.chip-sep { width: 1px; height: 24px; background: var(--border); }
 	.keep-c { color: var(--green); } .discard-c { color: var(--red); } .crash-c { color: var(--amber); } .karp-c { color: #3B82F6; }
 
-	.viz-tabs { display: flex; gap: 0.25rem; }
-	.viz-tab { padding: 0.3rem 0.6rem; border-radius: var(--radius-sm); border: 1px solid transparent; background: none; font-size: 0.72rem; font-weight: 500; color: var(--text-secondary); cursor: pointer; transition: all 0.15s ease; font-family: var(--font-body); }
-	.viz-tab:hover { background: var(--bg-hover); }
-	.viz-tab.active { background: var(--accent-light); color: var(--accent); border-color: var(--accent-medium); }
+	.x-links { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+	.x-links .x-logo { color: var(--text-dim); flex-shrink: 0; }
+	.x-links a { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-dim); text-decoration: none; transition: color 0.15s ease; }
+	.x-links a:hover { color: var(--text); }
 
 	/* Chart */
 	.viz-area { height: 340px; }

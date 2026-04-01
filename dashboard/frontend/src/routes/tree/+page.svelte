@@ -134,7 +134,7 @@
 	<!-- Floating Insight Sidebar -->
 	<div class="insight-float" class:collapsed={!showInsights}>
 		<button class="insight-toggle" onclick={() => (showInsights = !showInsights)}>
-			{showInsights ? '\u2715' : '\u2139'}
+			{showInsights ? '\u2715' : 'i'}
 		</button>
 		{#if showInsights}
 			<div class="insight-body">
