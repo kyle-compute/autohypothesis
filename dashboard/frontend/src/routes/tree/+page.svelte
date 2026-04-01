@@ -422,4 +422,12 @@
 	}
 	.dc-nav-btn:hover { color: var(--text); background: var(--bg-hover); border-color: var(--border-strong); }
 	.dc-nav-pos { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); }
+
+	@media (max-width: 768px) {
+		.tree-view { height: calc(100vh - 48px - 2rem); min-height: 400px; }
+		.detail-card { width: calc(100vw - 1.5rem); left: 0.75rem; right: 0.75rem; bottom: 0.75rem; max-height: 55vh; }
+		.insight-float:not(.collapsed) { width: calc(100vw - 1.5rem); right: 0.75rem; }
+		.insight-body { max-height: 40vh; }
+		.dc-bpb-val { font-size: 1.1rem; }
+	}
 </style>

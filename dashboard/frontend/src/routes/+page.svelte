@@ -65,11 +65,20 @@
 	});
 
 	// ── Chart: dual trajectory ──
-	const CHART_PAD = { top: 36, right: 80, bottom: 52, left: 72 };
+	let isNarrow = $state(typeof window !== 'undefined' && window.innerWidth < 768);
+	let CHART_PAD = $derived(isNarrow ? { top: 20, right: 12, bottom: 44, left: 44 } : { top: 36, right: 80, bottom: 52, left: 72 });
 	let chartW = $state(800);
-	const chartH = 340;
+	let chartH = $derived(isNarrow ? 260 : 340);
 	let innerW = $derived(chartW - CHART_PAD.left - CHART_PAD.right);
-	const innerH = chartH - CHART_PAD.top - CHART_PAD.bottom;
+	let innerH = $derived(chartH - CHART_PAD.top - CHART_PAD.bottom);
+
+	onMount(() => {
+		const mq = window.matchMedia('(max-width: 768px)');
+		isNarrow = mq.matches;
+		const handler = (e: MediaQueryListEvent) => { isNarrow = e.matches; };
+		mq.addEventListener('change', handler);
+		return () => mq.removeEventListener('change', handler);
+	});
 
 	let chartOwnExps = $derived([...ownExperiments].sort((a, b) => a.id - b.id));
 
@@ -344,9 +353,11 @@
 
 						<g transform="translate({CHART_PAD.left}, 0)">
 							<!-- Grid -->
-							{#each yTicks as tick}
-								<line x1="0" x2={innerW} y1={yScale(tick)} y2={yScale(tick)} stroke="var(--border)" stroke-width="1" />
-								<text x="-10" y={yScale(tick)} dy="3.5" text-anchor="end" class="ax-text">{tick.toFixed(3)}</text>
+							{#each yTicks as tick, i}
+								{#if !isNarrow || i % 2 === 0}
+									<line x1="0" x2={innerW} y1={yScale(tick)} y2={yScale(tick)} stroke="var(--border)" stroke-width="1" />
+									<text x="-6" y={yScale(tick)} dy="3.5" text-anchor="end" class="ax-text" style={isNarrow ? 'font-size:9px' : ''}>{tick.toFixed(3)}</text>
+								{/if}
 							{/each}
 
 							<!-- Outperformance zone (shaded area where our best < Karpathy's) -->
@@ -420,11 +431,16 @@
 								{@const fbx = xScaleOwn(firstBeatOwnIdx)}
 								{@const fby = yScale(firstBeatExp.val_bpb)}
 								<line x1={fbx} x2={fbx} y1={fby - 10} y2={CHART_PAD.top + 2} stroke="var(--green)" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.6" />
-								<g transform="translate({fbx},{CHART_PAD.top - 4})">
-									<rect x="-72" y="-16" width="144" height="22" rx="11" fill="var(--green)" opacity="0.15" />
-									<rect x="-72" y="-16" width="144" height="22" rx="11" fill="none" stroke="var(--green)" stroke-width="1" opacity="0.3" />
-									<text x="0" y="-5" text-anchor="middle" dominant-baseline="central" class="milestone-text" style="font-size: 11px">beat Karpathy @ #{firstBeatExp.id}</text>
-								</g>
+								{#if isNarrow}
+									<circle cx={fbx} cy={CHART_PAD.top - 2} r="6" fill="var(--green)" opacity="0.25" />
+									<text x={fbx} y={CHART_PAD.top - 2} text-anchor="middle" dominant-baseline="central" class="milestone-text" style="font-size: 8px">★</text>
+								{:else}
+									<g transform="translate({fbx},{CHART_PAD.top - 4})">
+										<rect x="-72" y="-16" width="144" height="22" rx="11" fill="var(--green)" opacity="0.15" />
+										<rect x="-72" y="-16" width="144" height="22" rx="11" fill="none" stroke="var(--green)" stroke-width="1" opacity="0.3" />
+										<text x="0" y="-5" text-anchor="middle" dominant-baseline="central" class="milestone-text" style="font-size: 11px">beat Karpathy @ #{firstBeatExp.id}</text>
+									</g>
+								{/if}
 							{/if}
 
 							<!-- Hover tooltip -->
@@ -433,38 +449,54 @@
 								{@const hx = xScaleOwn(chartHoveredIdx)}
 								{@const hy = yScale(hExp.val_bpb)}
 								<line x1={hx} x2={hx} y1={CHART_PAD.top} y2={CHART_PAD.top + innerH} stroke="var(--text-dim)" stroke-width="1" opacity="0.2" stroke-dasharray="3,3" />
-								{@const ty = hy < CHART_PAD.top + 70 ? hy + 18 : hy - 60}
-								{@const tx = hx > innerW - 130 ? hx - 200 : hx + 12}
+								{@const ttW = isNarrow ? 150 : 190}
+								{@const ttH = isNarrow ? 42 : 52}
+								{@const ty = hy < CHART_PAD.top + 70 ? hy + 18 : hy - ttH - 8}
+								{@const tx = hx > innerW - ttW ? hx - ttW - 10 : hx + 12}
 								<g transform="translate({tx},{ty})">
-									<rect x="0" y="0" width="190" height="52" rx="8" fill="var(--text)" opacity="0.95" />
-									<text x="10" y="19" class="tt-text" fill="white" font-weight="700">{hExp.val_bpb.toFixed(6)} bpb</text>
-									<text x="10" y="38" class="tt-sub" fill="rgba(255,255,255,0.65)">#{hExp.id} {hExp.experiment_id.replace(/^exp-\d+-/, '')} · {hExp.status}</text>
+									<rect x="0" y="0" width={ttW} height={ttH} rx="8" fill="var(--text)" opacity="0.95" />
+									<text x="8" y={isNarrow ? 16 : 19} class="tt-text" fill="white" font-weight="700" style={isNarrow ? 'font-size:10px' : ''}>{hExp.val_bpb.toFixed(6)} bpb</text>
+									<text x="8" y={isNarrow ? 32 : 38} class="tt-sub" fill="rgba(255,255,255,0.65)" style={isNarrow ? 'font-size:9px' : ''}>#{hExp.id} {hExp.experiment_id.replace(/^exp-\d+-/, '')} · {hExp.status}</text>
 								</g>
 							{/if}
 
 							<!-- X axis + ticks (% of search) -->
 							<line x1="0" x2={innerW} y1={CHART_PAD.top + innerH} y2={CHART_PAD.top + innerH} stroke="var(--border)" stroke-width="1" />
-							{#each [0, 25, 50, 75, 100] as pct}
+							{#each (isNarrow ? [0, 50, 100] : [0, 25, 50, 75, 100]) as pct}
 								{@const tx = (pct / 100) * innerW}
 								<line x1={tx} x2={tx} y1={CHART_PAD.top + innerH} y2={CHART_PAD.top + innerH + 5} stroke="var(--border-strong)" stroke-width="1" />
-								<text x={tx} y={CHART_PAD.top + innerH + 18} text-anchor="middle" class="ax-text">{pct}%</text>
+								<text x={tx} y={CHART_PAD.top + innerH + 16} text-anchor="middle" class="ax-text" style={isNarrow ? 'font-size:9px' : ''}>{pct}%</text>
 							{/each}
 						</g>
 
 						<!-- Legend -->
-						<g transform="translate({CHART_PAD.left + 12}, {chartH - 28})">
-							<rect x="-8" y="-14" width="620" height="24" rx="6" fill="var(--bg-card)" opacity="0.85" />
-							<line x1="0" x2="20" y1="-3" y2="-3" stroke="var(--green)" stroke-width="3.5" opacity="0.9" />
-							<circle cx="10" cy="-3" r="4" fill="var(--green)" />
-							<text x="28" y="1" class="leg-text" style="font-size: 11px; font-weight: 600; fill: var(--text-secondary)">Autonomous search ({ownExperiments.length} runs)</text>
-							<line x1="260" x2="280" y1="-3" y2="-3" stroke="#3B82F6" stroke-width="2.5" opacity="0.7" />
-							<circle cx="270" cy="-3" r="4" fill="#3B82F6" opacity="0.6" />
-							<text x="288" y="1" class="leg-text" style="font-size: 11px; fill: var(--text-dim)">Karpathy's search ({karpathyReproSorted.length} runs, same hardware)</text>
-						</g>
+						{#if isNarrow}
+							<g transform="translate({CHART_PAD.left + 8}, {chartH - 36})">
+								<rect x="-6" y="-12" width={innerW} height="32" rx="6" fill="var(--bg-card)" opacity="0.9" />
+								<line x1="0" x2="14" y1="-3" y2="-3" stroke="var(--green)" stroke-width="3" opacity="0.9" />
+								<circle cx="7" cy="-3" r="3" fill="var(--green)" />
+								<text x="20" y="1" class="leg-text" style="font-size: 10px; font-weight: 600; fill: var(--text-secondary)">Ours ({ownExperiments.length})</text>
+								<line x1="0" x2="14" y1="13" y2="13" stroke="#3B82F6" stroke-width="2.5" opacity="0.7" />
+								<circle cx="7" cy="13" r="3" fill="#3B82F6" opacity="0.6" />
+								<text x="20" y="17" class="leg-text" style="font-size: 10px; fill: var(--text-dim)">Karpathy ({karpathyReproSorted.length})</text>
+							</g>
+						{:else}
+							<g transform="translate({CHART_PAD.left + 12}, {chartH - 28})">
+								<rect x="-8" y="-14" width="620" height="24" rx="6" fill="var(--bg-card)" opacity="0.85" />
+								<line x1="0" x2="20" y1="-3" y2="-3" stroke="var(--green)" stroke-width="3.5" opacity="0.9" />
+								<circle cx="10" cy="-3" r="4" fill="var(--green)" />
+								<text x="28" y="1" class="leg-text" style="font-size: 11px; font-weight: 600; fill: var(--text-secondary)">Autonomous search ({ownExperiments.length} runs)</text>
+								<line x1="260" x2="280" y1="-3" y2="-3" stroke="#3B82F6" stroke-width="2.5" opacity="0.7" />
+								<circle cx="270" cy="-3" r="4" fill="#3B82F6" opacity="0.6" />
+								<text x="288" y="1" class="leg-text" style="font-size: 11px; fill: var(--text-dim)">Karpathy's search ({karpathyReproSorted.length} runs, same hardware)</text>
+							</g>
+						{/if}
 
 						<!-- Axis labels -->
-						<text x="16" y={CHART_PAD.top + innerH / 2} text-anchor="middle" class="ax-label" style="font-size: 12px" transform="rotate(-90, 16, {CHART_PAD.top + innerH / 2})">val_bpb (lower = better)</text>
-						<text x={CHART_PAD.left + innerW / 2} y={chartH - 4} text-anchor="middle" class="ax-label" style="font-size: 12px">search progress</text>
+						{#if !isNarrow}
+							<text x="16" y={CHART_PAD.top + innerH / 2} text-anchor="middle" class="ax-label" style="font-size: 12px" transform="rotate(-90, 16, {CHART_PAD.top + innerH / 2})">val_bpb (lower = better)</text>
+						{/if}
+						<text x={CHART_PAD.left + innerW / 2} y={chartH - 4} text-anchor="middle" class="ax-label" style="font-size: {isNarrow ? 10 : 12}px">{isNarrow ? 'search progress' : 'search progress'}</text>
 					</svg>
 				</div>
 		</div>
@@ -768,4 +800,29 @@
 	.diff-wrap { padding-bottom: 0.6rem; }
 	.empty { display: flex; align-items: center; justify-content: center; height: 100%; }
 	.empty p { color: var(--text-dim); font-size: 0.82rem; }
+
+	@media (max-width: 768px) {
+		.page { height: auto; min-height: calc(100vh - 48px - 2rem); overflow: visible; }
+		.top-section { border-radius: var(--radius-sm); }
+		.summary-row { flex-direction: column; align-items: flex-start; gap: 0.5rem; padding: 0.5rem 0.75rem; }
+		.chips { gap: 0.35rem 0.6rem; }
+		.chip-val { font-size: 0.78rem; }
+		.chip-lbl { font-size: 0.5rem; }
+		.chip-sep { width: auto; height: 1px; display: none; }
+		.viz-area { height: 260px; }
+		.chart-container { touch-action: pan-y; }
+		.browser { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+		.list-panel { max-height: 50vh; }
+		.detail-panel { min-height: 300px; }
+		.d-top { padding: 0.65rem 0.75rem 0.5rem; }
+		.d-title { font-size: 0.8rem; }
+		.d-bpb { font-size: 1.1rem; }
+		.d-metrics { padding: 0.4rem 0.75rem; gap: 0.25rem 0.4rem; }
+		.d-desc { padding: 0.45rem 0.75rem; }
+		.d-block { padding: 0.5rem 0.75rem; }
+		.d-collapse { padding: 0 0.75rem; }
+		.exp-row { padding: 0.45rem 0.5rem; }
+		.row-desc { display: none; }
+		.row-hyp { display: none; }
+	}
 </style>

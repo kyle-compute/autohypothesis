@@ -108,4 +108,11 @@
 		margin: 0 auto;
 		padding: 1.5rem 2rem 3rem;
 	}
+
+	@media (max-width: 768px) {
+		.nav-inner { padding: 0 1rem; height: 48px; }
+		.logo-text { display: none; }
+		.nav-link { padding: 0.35rem 0.5rem; font-size: 0.8rem; }
+		main { padding: 0.75rem 0.75rem 2rem; }
+	}
 </style>
