@@ -1,8 +1,23 @@
 # autoresearch
 
-![teaser](progress.png)
-
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+
+## Results
+
+![comparison](comparison_chart.png)
+
+Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) ran **125 experiments** to find its best LLM training configuration on an H100. We beat that result in **13 runs** — same GPU, same eval metric, same 5-minute training budget per run. 65 minutes of total compute.
+
+| | Autohypothesis | Karpathy |
+|---|---|---|
+| **Best val_bpb** | 0.9722 | 0.9744 |
+| **Runs to beat baseline** | 13 | 125 |
+| **Total experiments** | 71 | 126 |
+| **Kept improvements** | 12 | 23 |
+
+All numbers measured on the same hardware (NVIDIA H100 80GB). Karpathy's results were reproduced locally to eliminate hardware variance.
+
+The difference: his system is a single-agent loop. Ours is a multi-agent research org — an observer agent dispatches hypotheses to workers, tracks lineage across every run, and makes structured decisions about what to try next. Each hypothesis builds on the full history, not just the last result. The difference between search and science.
 
 The idea: give an AI research org a small but real LLM training setup and let it run a disciplined scientific search. The system establishes a local baseline on the target hardware, promotes the best locally kept configuration to the active reference point, dispatches hypotheses across workers, and records both metrics and reasoning into a lineage view at `/history`. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The operator controls the org through Markdown and generated fleet state instead of manually managing each experiment. A bit more context on the original project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
 
