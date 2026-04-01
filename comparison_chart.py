@@ -96,7 +96,8 @@ beat_num = beat_exp.get("ordinal", first_beat_idx + 1) if beat_exp else "?"
 # ══════════════════════════════════════════════════════════
 # 4. Plot
 # ══════════════════════════════════════════════════════════
-fig, ax = plt.subplots(figsize=(18, 8.5))
+fig, ax = plt.subplots(figsize=(18, 9))
+fig.subplots_adjust(top=0.85)
 fig.patch.set_facecolor("white")
 ax.set_facecolor("white")
 ax.grid(True, alpha=0.15, linewidth=0.5, color="#888")
@@ -197,10 +198,13 @@ ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f"))
 ax.set_xticks(list(range(0, KARPATHY_TOTAL_RUNS + 10, 10)))
 
 our_kept_n = len([r for r in our_runs if r["status"] == "keep"])
+
+fig.suptitle("autohypothesis.com", fontsize=22, fontweight="700",
+             color="#3B82F6", y=0.98)
 ax.set_title(
-    f"Autohypothesis beat Karpathy's {KARPATHY_TOTAL_RUNS}-run result in {beat_num} experiments\n"
+    f"Beat Karpathy's {KARPATHY_TOTAL_RUNS}-run result in {beat_num} experiments\n"
     f"(all results on same hardware — NVIDIA H100 80GB)",
-    fontsize=16, fontweight="700", pad=14,
+    fontsize=15, fontweight="700", pad=8,
 )
 
 legend_elements = [
@@ -223,7 +227,7 @@ fig.text(0.97, 0.02, "@kylecompute  @yimothysu  @patrikkml",
          ha="right", va="bottom", fontsize=11, color="#999",
          fontstyle="italic", transform=fig.transFigure)
 
-plt.tight_layout()
+plt.tight_layout(rect=[0, 0, 1, 0.90])
 plt.savefig("comparison_chart.png", dpi=200, bbox_inches="tight", facecolor="white")
 plt.savefig("comparison_chart.svg", bbox_inches="tight", facecolor="white")
 print("Saved comparison_chart.png and comparison_chart.svg")
