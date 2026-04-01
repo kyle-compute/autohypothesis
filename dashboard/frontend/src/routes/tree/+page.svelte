@@ -33,11 +33,11 @@
 	}
 
 	let plateaus = $derived.by((): Plateau[] => {
-		const kept = experiments.filter(e => e.status === 'keep').sort((a, b) => String(a.id).localeCompare(String(b.id)));
+		const kept = experiments.filter(e => e.status === 'keep').sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0));
 		return kept.map(parent => {
 			const children: PlateauChild[] = experiments
-				.filter(e => e.parent_commit === parent.commit && e.id !== parent.id)
-				.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+				.filter(e => e.parent_commit === parent.commit && e.experiment_id !== parent.experiment_id)
+				.sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0))
 				.map(exp => ({ exp, paramChanges: paramDiff(exp, parent) }));
 			return { parent, children };
 		});
@@ -105,7 +105,7 @@
 
 	// Keep traversal
 	let keepExps = $derived(
-		experiments.filter(e => e.status === 'keep').sort((a, b) => String(a.id).localeCompare(String(b.id)))
+		experiments.filter(e => e.status === 'keep').sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0))
 	);
 
 	let keepIdx = $derived(

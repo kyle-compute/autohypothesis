@@ -40,7 +40,7 @@
 			? experiments.filter(e => !isKarpathyRun(e))  // Don't show karpathy runs in list
 			: experiments.filter(e => e.status === filterStatus && !isKarpathyRun(e))
 	);
-	let sorted = $derived([...filtered].sort((a, b) => a.id - b.id));
+	let sorted = $derived([...filtered].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0)));
 
 	let ownBestBpb = $derived.by(() => {
 		const kept = ownExperiments.filter(e => e.status === 'keep');
@@ -57,7 +57,7 @@
 	// First experiment to beat Karpathy's best
 	let firstBeatExp = $derived.by((): Experiment | null => {
 		if (karpathyBestBpb == null) return null;
-		const sorted = [...ownExperiments].sort((a, b) => a.id - b.id);
+		const sorted = [...ownExperiments].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0));
 		for (const e of sorted) {
 			if (e.status === 'keep' && e.val_bpb < karpathyBestBpb) return e;
 		}
@@ -80,13 +80,13 @@
 		return () => mq.removeEventListener('change', handler);
 	});
 
-	let chartOwnExps = $derived([...ownExperiments].sort((a, b) => a.id - b.id));
+	let chartOwnExps = $derived([...ownExperiments].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0)));
 
 	// Karpathy trajectories:
 	// - karpathyOriginal: his 125 runs on his machine (from TSV)
 	// - karpathyRepro: his config steps reproduced on OUR machine (karpathy-k* in jsonl)
 	let karpathyReproSorted = $derived(
-		[...karpathyExps].sort((a, b) => a.id - b.id)
+		[...karpathyExps].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0))
 	);
 	let karpathyTrajectory = $derived.by(() => {
 		if (karpathyRuns.length === 0) return [] as { x: number; bpb: number }[];
@@ -201,7 +201,7 @@
 	// First beat index in our experiments
 	let firstBeatOwnIdx = $derived.by((): number | null => {
 		if (!firstBeatExp) return null;
-		return chartOwnExps.findIndex(e => e.id === firstBeatExp!.id);
+		return chartOwnExps.findIndex(e => e.experiment_id === firstBeatExp!.experiment_id);
 	});
 
 	function onChartMouseMove(e: MouseEvent) {
@@ -264,21 +264,21 @@
 	let bestSoFarMap = $derived.by(() => {
 		const map = new Map<number, number>();
 		let best = Infinity;
-		const sorted = [...ownExperiments].sort((a, b) => a.id - b.id);
+		const sorted = [...ownExperiments].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0));
 		for (const e of sorted) {
 			if (e.status === 'keep' && e.val_bpb < best) best = e.val_bpb;
-			if (best < Infinity) map.set(e.id, best);
+			if (best < Infinity) map.set(e.ordinal ?? 0, best);
 		}
 		return map;
 	});
-	function bestSoFarAt(id: number): number | undefined {
-		return bestSoFarMap.get(id);
+	function bestSoFarAt(ordinal: number): number | undefined {
+		return bestSoFarMap.get(ordinal);
 	}
 
 	let listScrollEl: HTMLDivElement | undefined = $state();
 	$effect(() => {
 		if (selectedExp && listScrollEl) {
-			const row = listScrollEl.querySelector(`[data-id="${selectedExp.id}"]`);
+			const row = listScrollEl.querySelector(`[data-id="${selectedExp.experiment_id}"]`);
 			if (row) row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 		}
 	});
@@ -312,7 +312,7 @@
 				{/if}
 				{#if firstBeatExp}
 					<div class="chip">
-						<span class="chip-val good">Run #{firstBeatExp.id}</span>
+						<span class="chip-val good">Run #{firstBeatExp.ordinal}</span>
 						<span class="chip-lbl">First beat (vs 125)</span>
 					</div>
 				{/if}
@@ -417,7 +417,7 @@
 								{@const cy = yScale(exp.val_bpb)}
 								{@const isKeep = exp.status === 'keep'}
 								{@const isCrash = exp.status === 'crash'}
-								{@const active = chartHoveredIdx === i || selectedExp?.id === exp.id}
+								{@const active = chartHoveredIdx === i || selectedExp?.experiment_id === exp.experiment_id}
 								{#if isKeep}
 									<circle {cx} {cy} r={active ? 7 : 5} fill="var(--green)" opacity={active ? 1 : 0.9} class="dot" />
 								{:else if isCrash}
@@ -426,7 +426,7 @@
 								{:else}
 									<circle {cx} {cy} r={active ? 5 : 3} fill="var(--bg-card)" stroke="var(--border-strong)" stroke-width="1.5" opacity={active ? 1 : 0.55} class="dot" />
 								{/if}
-								{#if selectedExp?.id === exp.id}
+								{#if selectedExp?.experiment_id === exp.experiment_id}
 									<circle {cx} {cy} r="12" fill="none" stroke="var(--accent)" stroke-width="2.5" opacity="0.5" />
 								{/if}
 							{/each}
@@ -443,7 +443,7 @@
 									<g transform="translate({fbx},{CHART_PAD.top - 4})">
 										<rect x="-72" y="-16" width="144" height="22" rx="11" fill="var(--green)" opacity="0.15" />
 										<rect x="-72" y="-16" width="144" height="22" rx="11" fill="none" stroke="var(--green)" stroke-width="1" opacity="0.3" />
-										<text x="0" y="-5" text-anchor="middle" dominant-baseline="central" class="milestone-text" style="font-size: 11px">beat Karpathy @ #{firstBeatExp.id}</text>
+										<text x="0" y="-5" text-anchor="middle" dominant-baseline="central" class="milestone-text" style="font-size: 11px">beat Karpathy @ #{firstBeatExp.ordinal}</text>
 									</g>
 								{/if}
 							{/if}
@@ -461,7 +461,7 @@
 								<g transform="translate({tx},{ty})">
 									<rect x="0" y="0" width={ttW} height={ttH} rx="8" fill="var(--text)" opacity="0.95" />
 									<text x="8" y={isNarrow ? 16 : 19} class="tt-text" fill="white" font-weight="700" style={isNarrow ? 'font-size:10px' : ''}>{hExp.val_bpb.toFixed(6)} bpb</text>
-									<text x="8" y={isNarrow ? 32 : 38} class="tt-sub" fill="rgba(255,255,255,0.65)" style={isNarrow ? 'font-size:9px' : ''}>#{hExp.id} {hExp.experiment_id.replace(/^exp-\d+-/, '')} · {hExp.status}</text>
+									<text x="8" y={isNarrow ? 32 : 38} class="tt-sub" fill="rgba(255,255,255,0.65)" style={isNarrow ? 'font-size:9px' : ''}>#{hExp.ordinal} {hExp.experiment_id.replace(/^exp-\d+-/, '')} · {hExp.status}</text>
 								</g>
 							{/if}
 
@@ -521,13 +521,13 @@
 				</div>
 			</div>
 			<div class="list-scroll" bind:this={listScrollEl}>
-				{#each sorted as exp (exp.id)}
-					{@const isSelected = selectedExp?.id === exp.id}
+				{#each sorted as exp (exp.experiment_id)}
+					{@const isSelected = selectedExp?.experiment_id === exp.experiment_id}
 					{@const isBest = ownBestBpb != null && exp.val_bpb === ownBestBpb && exp.status === 'keep' && isOwnExperiment(exp)}
 					{@const bench = isBenchmark(exp)}
-					{@const isNewBest = exp.status === 'keep' && bestSoFarAt(exp.id) === exp.val_bpb && exp.id > 1}
+					{@const isNewBest = exp.status === 'keep' && bestSoFarAt(exp.ordinal ?? 0) === exp.val_bpb && (exp.ordinal ?? 0) > 1}
 					{@const beatsK = karpathyBestBpb != null && exp.val_bpb < karpathyBestBpb && exp.status === 'keep' && !bench}
-					<button class="exp-row" class:selected={isSelected} class:is-best={isBest} class:is-bench={bench} class:is-new-best={isNewBest && !isBest} data-id={exp.id} onclick={() => selectExp(exp)}>
+					<button class="exp-row" class:selected={isSelected} class:is-best={isBest} class:is-bench={bench} class:is-new-best={isNewBest && !isBest} data-id={exp.experiment_id} onclick={() => selectExp(exp)}>
 						<div class="row-left">
 							{#if bench}
 								<span class="row-badge bench">K</span>
@@ -540,7 +540,7 @@
 							{/if}
 							<div class="row-info">
 								<span class="row-name">
-									<span class="row-num">#{exp.id}</span>
+									<span class="row-num">#{exp.ordinal}</span>
 									{exp.experiment_id.replace(/^exp-\d+-/, '')}
 								</span>
 								<span class="row-desc">{exp.description}</span>

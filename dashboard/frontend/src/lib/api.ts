@@ -7,7 +7,7 @@ export async function fetchExperiments(): Promise<Experiment[]> {
 	return raw.map((r, i) => ({
 		...r,
 		experiment_id: r.id,
-		id: r.ordinal ?? i + 1,
+		ordinal: r.ordinal ?? i + 1,
 	}));
 }
 

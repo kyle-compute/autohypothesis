@@ -19,7 +19,7 @@
 	);
 
 	let recent = $derived(
-		[...experiments].sort((a, b) => String(b.id).localeCompare(String(a.id))).slice(0, 10)
+		[...experiments].sort((a, b) => (b.ordinal ?? 0) - (a.ordinal ?? 0)).slice(0, 10)
 	);
 	let recentRate = $derived(
 		recent.length > 0
@@ -38,7 +38,7 @@
 	});
 
 	let totalImprovement = $derived.by(() => {
-		const sorted = [...kept].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+		const sorted = [...kept].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0));
 		if (sorted.length < 2) return null;
 		const first = sorted[0].val_bpb;
 		const best = Math.min(...sorted.map(e => e.val_bpb));

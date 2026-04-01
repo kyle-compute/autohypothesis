@@ -84,22 +84,26 @@
 		return map;
 	});
 
-	let graphNodes = $derived.by((): GNode[] => {
-		if (experiments.length === 0) return [];
+	let sorted = $derived(
+		[...experiments].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0))
+	);
 
-		const bpbs = experiments.map(e => e.val_bpb);
+	let graphNodes = $derived.by((): GNode[] => {
+		if (sorted.length === 0) return [];
+
+		const bpbs = sorted.map(e => e.val_bpb);
 		const minBpb = Math.min(...bpbs);
 		const maxBpb = Math.max(...bpbs);
 		const bpbRange = maxBpb - minBpb || 0.1;
 		const bpbPad = bpbRange * 0.15;
 
-		const count = experiments.length;
+		const count = sorted.length;
 		const maxIndex = count - 1 || 1;
 
 		const gw = Math.max(width * 1.2, count * 120);
 		const gh = Math.max(height * 0.9, 500);
 
-		return experiments.map((exp, index) => {
+		return sorted.map((exp, index) => {
 			const x = PAD + (index / maxIndex) * (gw - PAD * 2);
 			const y = PAD + ((exp.val_bpb - (minBpb - bpbPad)) / (bpbRange + bpbPad * 2)) * (gh - PAD * 2);
 

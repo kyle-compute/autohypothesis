@@ -1,5 +1,5 @@
 export interface Experiment {
-	id: number;
+	id: string;
 	experiment_id: string;
 	commit: string;
 	parent_commit: string;
