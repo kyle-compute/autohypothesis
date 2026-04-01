@@ -6,8 +6,8 @@
 <nav>
 	<div class="nav-inner">
 		<a href="/" class="logo">
-			<span class="logo-mark">ar</span>
-			<span class="logo-text">autoresearch</span>
+			<span class="logo-mark">ah</span>
+			<span class="logo-text">autohypothesis</span>
 		</a>
 		<div class="nav-links">
 			<a href="/" class="nav-link">
