@@ -218,6 +218,11 @@ legend_elements = [
 ax.legend(handles=legend_elements, loc="upper right", fontsize=10, framealpha=0.95,
           edgecolor="#ddd", fancybox=True)
 
+# ── X / Twitter handles ──
+fig.text(0.99, 0.01, "@kylecompute  @yimothysu  @patrikkml",
+         ha="right", va="bottom", fontsize=9, color="#999",
+         fontstyle="italic", transform=fig.transFigure)
+
 plt.tight_layout()
 plt.savefig("comparison_chart.png", dpi=200, bbox_inches="tight", facecolor="white")
 plt.savefig("comparison_chart.svg", bbox_inches="tight", facecolor="white")
