@@ -288,7 +288,7 @@
 
 	function onPointerDown(e: PointerEvent) {
 		if (e.button !== 0) return;
-		if ((e.target as HTMLElement).closest('.graph-node')) return;
+		if ((e.target as HTMLElement).closest('.graph-node, .watermark a')) return;
 		isPanning = true;
 		panOrigin = { x: e.clientX, y: e.clientY, tx, ty };
 		containerEl.setPointerCapture(e.pointerId);
@@ -530,6 +530,7 @@
 		display: flex; align-items: center; gap: 0.35rem;
 		font-family: var(--font-mono); font-size: 0.72rem; font-weight: 500;
 		color: var(--text-dim); opacity: 0.6;
+		pointer-events: none;
 	}
 	.watermark a {
 		color: var(--text-dim); text-decoration: none; transition: color 0.15s ease;
