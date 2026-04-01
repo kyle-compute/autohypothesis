@@ -219,8 +219,8 @@ ax.legend(handles=legend_elements, loc="upper right", fontsize=10, framealpha=0.
           edgecolor="#ddd", fancybox=True)
 
 # ── X / Twitter handles ──
-fig.text(0.99, 0.01, "@kylecompute  @yimothysu  @patrikkml",
-         ha="right", va="bottom", fontsize=9, color="#999",
+fig.text(0.97, 0.02, "@kylecompute  @yimothysu  @patrikkml",
+         ha="right", va="bottom", fontsize=11, color="#999",
          fontstyle="italic", transform=fig.transFigure)
 
 plt.tight_layout()
